@@ -7,6 +7,7 @@
 
 #define PORT 11702
 #define SERVER_IP "127.0.0.1"
+#define BUFFER_SIZE 1024
 
 int main(void)
 {
@@ -15,14 +16,13 @@ int main(void)
     struct sockaddr_in server_address;
 
     char username[64];
-    char command[1024];
-    char response[1024];
+    char command[BUFFER_SIZE];
+    char response[BUFFER_SIZE];
 
     ssize_t bytes_received;
 
     /*
-     * Step 1:
-     * Create an IPv4 TCP socket.
+     * Step 1: Create TCP socket.
      */
     client_socket = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -34,9 +34,9 @@ int main(void)
 
     printf("Client socket created successfully.\n");
 
+
     /*
-     * Step 2:
-     * Prepare server address.
+     * Step 2: Prepare server address.
      */
     memset(&server_address, 0, sizeof(server_address));
 
@@ -48,13 +48,15 @@ int main(void)
                   &server_address.sin_addr) <= 0)
     {
         perror("inet_pton");
+
         close(client_socket);
+
         return 1;
     }
 
+
     /*
-     * Step 3:
-     * Connect to the NetMessenger server.
+     * Step 3: Connect to server.
      */
     printf("Connecting to server %s:%d...\n",
            SERVER_IP,
@@ -65,53 +67,75 @@ int main(void)
                 sizeof(server_address)) < 0)
     {
         perror("connect");
+
         close(client_socket);
+
         return 1;
     }
 
     printf("Connected to NetMessenger server successfully!\n");
 
+
     /*
-     * Step 4:
-     * REGISTER must be the first command.
+     * Step 4: REGISTER must be first command.
      */
     printf("Enter username: ");
 
-    if (fgets(username, sizeof(username), stdin) == NULL)
+    if (fgets(username,
+              sizeof(username),
+              stdin) == NULL)
     {
         close(client_socket);
+
         return 1;
     }
 
+    /*
+     * Remove newline from username.
+     */
     username[strcspn(username, "\n")] = '\0';
 
+
+    /*
+     * Build REGISTER command.
+     */
     snprintf(command,
              sizeof(command),
              "REGISTER %s\n",
              username);
 
+
+    /*
+     * Send REGISTER command.
+     */
     if (send(client_socket,
              command,
              strlen(command),
              0) < 0)
     {
         perror("send");
+
         close(client_socket);
+
         return 1;
     }
+
 
     /*
      * Receive REGISTER response.
      */
-    bytes_received = recv(client_socket,
-                          response,
-                          sizeof(response) - 1,
-                          0);
+    bytes_received =
+        recv(client_socket,
+             response,
+             sizeof(response) - 1,
+             0);
 
     if (bytes_received <= 0)
     {
         printf("Server disconnected.\n");
+
         close(client_socket);
+
         return 1;
     }
 
@@ -119,15 +143,28 @@ int main(void)
 
     printf("Server: %s", response);
 
+
+    /*
+     * If REGISTER failed, do not continue.
+     */
+    if (strncmp(response, "OK REGISTERED", 13) != 0)
+    {
+        printf("Registration failed.\n");
+
+        close(client_socket);
+
+        return 1;
+    }
+
+
     /*
      * Step 5:
-     * Keep the client connected.
-     *
-     * The user can now type protocol commands.
+     * Interactive command loop.
      */
     while (1)
     {
         printf("> ");
+        fflush(stdout);
 
         if (fgets(command,
                   sizeof(command),
@@ -136,9 +173,9 @@ int main(void)
             break;
         }
 
+
         /*
-         * fgets() already keeps the newline,
-         * which matches our line-based protocol.
+         * Send command to server.
          */
         if (send(client_socket,
                  command,
@@ -146,25 +183,41 @@ int main(void)
                  0) < 0)
         {
             perror("send");
+
             break;
         }
 
+
         /*
-         * QUIT will later be handled properly
-         * by the server.
+         * Wait for server response.
+         */
+        bytes_received =
+            recv(client_socket,
+                 response,
+                 sizeof(response) - 1,
+                 0);
+
+        if (bytes_received <= 0)
+        {
+            printf("Server disconnected.\n");
+
+            break;
+        }
+
+        response[bytes_received] = '\0';
+
+        printf("Server: %s", response);
+
+
+        /*
+         * QUIT ends the client.
          */
         if (strncmp(command, "QUIT", 4) == 0)
         {
             break;
         }
-
-        /*
-         * At this intermediate stage the server
-         * does not yet send responses for LIST,
-         * BCAST, etc., so we do not call recv()
-         * here yet.
-         */
     }
+
 
     close(client_socket);
 
