@@ -11,9 +11,6 @@
 #define USERNAME_SIZE 64
 #define BUFFER_SIZE 1024
 
-/*
- * Information stored for each connected client.
- */
 typedef struct
 {
     int socket;
@@ -21,27 +18,14 @@ typedef struct
     int active;
 } Client;
 
-
-/*
- * Shared client table.
- * All client threads can access this table.
- */
 Client clients[MAX_CLIENTS];
 
-/*
- * Mutex protects the shared clients[] table
- * from race conditions.
- */
 pthread_mutex_t clients_mutex =
     PTHREAD_MUTEX_INITIALIZER;
 
 
-/*
- * Check whether a username is already being used.
- *
- * IMPORTANT:
- * Caller must already hold clients_mutex.
- */
+/* Check whether username already exists.
+   Caller must hold clients_mutex. */
 int username_exists(const char *username)
 {
     int i;
@@ -59,16 +43,8 @@ int username_exists(const char *username)
 }
 
 
-/*
- * Add a registered client to the shared client table.
- *
- * Returns:
- *   1 = successfully added
- *   0 = no free slot
- *
- * IMPORTANT:
- * Caller must already hold clients_mutex.
- */
+/* Add client to shared table.
+   Caller must hold clients_mutex. */
 int add_client(int socket, const char *username)
 {
     int i;
@@ -95,10 +71,7 @@ int add_client(int socket, const char *username)
 }
 
 
-/*
- * Remove a client from the shared table
- * when the client disconnects.
- */
+/* Remove disconnected client. */
 void remove_client(int socket)
 {
     int i;
@@ -125,13 +98,7 @@ void remove_client(int socket)
 }
 
 
-/*
- * Send the list of currently connected users.
- *
- * Protocol response:
- *
- * USERS <u1> <u2> ... NID:6957
- */
+/* Send connected user list. */
 void send_user_list(int client_socket)
 {
     char response[BUFFER_SIZE];
@@ -146,8 +113,8 @@ void send_user_list(int client_socket)
         if (clients[i].active)
         {
             if (strlen(response) +
-                    strlen(clients[i].username) +
-                    2 < sizeof(response))
+                strlen(clients[i].username) +
+                20 < sizeof(response))
             {
                 strcat(response, " ");
                 strcat(response, clients[i].username);
@@ -167,9 +134,40 @@ void send_user_list(int client_socket)
 
 
 /*
- * Handles one connected client.
- * Every connected client runs in its own thread.
+ * Broadcast a message to every connected client.
+ *
+ * EVENT BCAST <from> <message>
  */
+void broadcast_message(const char *from,
+                       const char *message)
+{
+    char event[BUFFER_SIZE];
+    int i;
+
+    snprintf(event,
+             sizeof(event),
+             "EVENT BCAST %s %s\n",
+             from,
+             message);
+
+    pthread_mutex_lock(&clients_mutex);
+
+    for (i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (clients[i].active)
+        {
+            send(clients[i].socket,
+                 event,
+                 strlen(event),
+                 0);
+        }
+    }
+
+    pthread_mutex_unlock(&clients_mutex);
+}
+
+
+/* Handle one client connection. */
 void *handle_client(void *arg)
 {
     int client_socket = *((int *)arg);
@@ -181,19 +179,14 @@ void *handle_client(void *arg)
 
     int registered = 0;
 
-    /*
-     * Socket descriptor has been copied,
-     * so allocated memory is no longer needed.
-     */
     free(arg);
 
     printf("Client thread started.\n");
 
-    /*
-     * ========================================
-     * FIRST COMMAND MUST BE REGISTER
-     * ========================================
-     */
+
+    /* =====================================
+       REGISTER
+       ===================================== */
 
     memset(buffer, 0, sizeof(buffer));
 
@@ -217,9 +210,6 @@ void *handle_client(void *arg)
     printf("Received: %s", buffer);
 
 
-    /*
-     * Check whether first command is REGISTER.
-     */
     if (strncmp(buffer, "REGISTER ", 9) != 0)
     {
         const char *error =
@@ -236,9 +226,6 @@ void *handle_client(void *arg)
     }
 
 
-    /*
-     * Extract username.
-     */
     if (sscanf(buffer + 9,
                "%63s",
                username) != 1)
@@ -257,13 +244,8 @@ void *handle_client(void *arg)
     }
 
 
-    /*
-     * ========================================
-     * CHECK DUPLICATE USERNAME
-     * ========================================
-     */
-
     pthread_mutex_lock(&clients_mutex);
+
 
     if (username_exists(username))
     {
@@ -286,9 +268,6 @@ void *handle_client(void *arg)
     }
 
 
-    /*
-     * Add user to connected-user table.
-     */
     if (!add_client(client_socket, username))
     {
         pthread_mutex_unlock(&clients_mutex);
@@ -306,14 +285,12 @@ void *handle_client(void *arg)
         return NULL;
     }
 
+
     pthread_mutex_unlock(&clients_mutex);
 
     registered = 1;
 
 
-    /*
-     * Send successful REGISTER response.
-     */
     {
         char response[256];
 
@@ -333,14 +310,10 @@ void *handle_client(void *arg)
            username);
 
 
-    /*
-     * ========================================
-     * COMMAND LOOP
-     * ========================================
-     *
-     * Client stays connected and can send
-     * more protocol commands.
-     */
+    /* =====================================
+       COMMAND LOOP
+       ===================================== */
+
     while (1)
     {
         memset(buffer, 0, sizeof(buffer));
@@ -351,6 +324,7 @@ void *handle_client(void *arg)
                  sizeof(buffer) - 1,
                  0);
 
+
         if (bytes_received <= 0)
         {
             printf("Client %s disconnected.\n",
@@ -359,6 +333,7 @@ void *handle_client(void *arg)
             break;
         }
 
+
         buffer[bytes_received] = '\0';
 
         printf("Command from %s: %s",
@@ -366,25 +341,76 @@ void *handle_client(void *arg)
                buffer);
 
 
-        /*
-         * ====================================
-         * LIST
-         * ====================================
-         */
-        if (strcmp(buffer, "LIST\n") == 0 ||
-            strcmp(buffer, "LIST\r\n") == 0)
+        /* Remove newline characters. */
+        buffer[strcspn(buffer, "\r\n")] = '\0';
+
+
+        /* =================================
+           LIST
+           ================================= */
+        if (strcmp(buffer, "LIST") == 0)
         {
             send_user_list(client_socket);
         }
 
 
-        /*
-         * ====================================
-         * QUIT
-         * ====================================
-         */
-        else if (strcmp(buffer, "QUIT\n") == 0 ||
-                 strcmp(buffer, "QUIT\r\n") == 0)
+        /* =================================
+           BCAST
+           ================================= */
+        else if (strncmp(buffer,
+                         "BCAST ",
+                         6) == 0)
+        {
+            char *message = buffer + 6;
+
+
+            if (strlen(message) == 0)
+            {
+                const char *error =
+                    "ERR 005 INVALID_BCAST NID:6957\n";
+
+                send(client_socket,
+                     error,
+                     strlen(error),
+                     0);
+
+                continue;
+            }
+
+
+            /*
+             * First send acknowledgement
+             * to the sender.
+             */
+            {
+                const char *response =
+                    "OK BCAST NID:6957\n";
+
+                send(client_socket,
+                     response,
+                     strlen(response),
+                     0);
+            }
+
+
+            /*
+             * Then deliver EVENT BCAST
+             * to all connected clients.
+             */
+            broadcast_message(username,
+                              message);
+
+
+            printf("Broadcast from %s: %s\n",
+                   username,
+                   message);
+        }
+
+
+        /* =================================
+           QUIT
+           ================================= */
+        else if (strcmp(buffer, "QUIT") == 0)
         {
             const char *response =
                 "OK BYE NID:6957\n";
@@ -401,11 +427,9 @@ void *handle_client(void *arg)
         }
 
 
-        /*
-         * ====================================
-         * COMMANDS NOT IMPLEMENTED YET
-         * ====================================
-         */
+        /* =================================
+           UNKNOWN COMMAND
+           ================================= */
         else
         {
             const char *error =
@@ -419,13 +443,11 @@ void *handle_client(void *arg)
     }
 
 
-    /*
-     * Remove user from connected-user table.
-     */
     if (registered)
     {
         remove_client(client_socket);
     }
+
 
     close(client_socket);
 
@@ -435,11 +457,6 @@ void *handle_client(void *arg)
 }
 
 
-/*
- * ============================================
- * MAIN SERVER
- * ============================================
- */
 int main(void)
 {
     int server_socket;
@@ -450,21 +467,15 @@ int main(void)
     socklen_t client_length;
 
 
-    /*
-     * Initialise client table.
-     */
     memset(clients, 0, sizeof(clients));
 
 
-    /*
-     * ========================================
-     * STEP 1: CREATE TCP SOCKET
-     * ========================================
-     */
+    /* Create TCP socket. */
     server_socket =
         socket(AF_INET,
                SOCK_STREAM,
                0);
+
 
     if (server_socket < 0)
     {
@@ -473,17 +484,15 @@ int main(void)
         return 1;
     }
 
+
     printf("Server socket created successfully.\n");
 
 
-    /*
-     * ========================================
-     * STEP 2: PREPARE SERVER ADDRESS
-     * ========================================
-     */
+    /* Prepare server address. */
     memset(&server_address,
            0,
            sizeof(server_address));
+
 
     server_address.sin_family = AF_INET;
 
@@ -494,11 +503,7 @@ int main(void)
         htons(PORT);
 
 
-    /*
-     * ========================================
-     * STEP 3: BIND
-     * ========================================
-     */
+    /* Bind to personalised port. */
     if (bind(server_socket,
              (struct sockaddr *)&server_address,
              sizeof(server_address)) < 0)
@@ -510,15 +515,12 @@ int main(void)
         return 1;
     }
 
+
     printf("Server bound to port %d.\n",
            PORT);
 
 
-    /*
-     * ========================================
-     * STEP 4: LISTEN
-     * ========================================
-     */
+    /* Listen for clients. */
     if (listen(server_socket,
                MAX_CLIENTS) < 0)
     {
@@ -529,15 +531,12 @@ int main(void)
         return 1;
     }
 
+
     printf("NetMessenger server listening on port %d...\n",
            PORT);
 
 
-    /*
-     * ========================================
-     * STEP 5: ACCEPT CLIENTS CONTINUOUSLY
-     * ========================================
-     */
+    /* Accept clients continuously. */
     while (1)
     {
         int *client_socket_ptr;
@@ -548,6 +547,7 @@ int main(void)
         client_socket_ptr =
             malloc(sizeof(int));
 
+
         if (client_socket_ptr == NULL)
         {
             perror("malloc");
@@ -556,9 +556,6 @@ int main(void)
         }
 
 
-        /*
-         * Reset address length before accept().
-         */
         client_length =
             sizeof(client_address);
 
@@ -582,9 +579,6 @@ int main(void)
         printf("A client connected successfully!\n");
 
 
-        /*
-         * Create separate thread for client.
-         */
         if (pthread_create(&thread_id,
                            NULL,
                            handle_client,
@@ -600,10 +594,6 @@ int main(void)
         }
 
 
-        /*
-         * Thread resources are automatically
-         * released after it finishes.
-         */
         pthread_detach(thread_id);
     }
 

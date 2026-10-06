@@ -4,10 +4,72 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <pthread.h>
 
 #define PORT 11702
 #define SERVER_IP "127.0.0.1"
 #define BUFFER_SIZE 1024
+
+int client_running = 1;
+
+
+/*
+ * Receiver thread.
+ *
+ * Continuously receives messages/events
+ * from the server while the main thread
+ * accepts keyboard commands.
+ */
+void *receive_messages(void *arg)
+{
+    int client_socket = *((int *)arg);
+
+    char buffer[BUFFER_SIZE];
+
+    ssize_t bytes_received;
+
+
+    while (client_running)
+    {
+        memset(buffer, 0, sizeof(buffer));
+
+
+        bytes_received =
+            recv(client_socket,
+                 buffer,
+                 sizeof(buffer) - 1,
+                 0);
+
+
+        if (bytes_received <= 0)
+        {
+            if (client_running)
+            {
+                printf("\nServer disconnected.\n");
+            }
+
+            client_running = 0;
+
+            break;
+        }
+
+
+        buffer[bytes_received] = '\0';
+
+
+        printf("\nServer: %s",
+               buffer);
+
+
+        printf("> ");
+
+        fflush(stdout);
+    }
+
+
+    return NULL;
+}
+
 
 int main(void)
 {
@@ -21,27 +83,39 @@ int main(void)
 
     ssize_t bytes_received;
 
-    /*
-     * Step 1: Create TCP socket.
-     */
-    client_socket = socket(AF_INET, SOCK_STREAM, 0);
+    pthread_t receiver_thread;
+
+
+    /* Create TCP socket. */
+    client_socket =
+        socket(AF_INET,
+               SOCK_STREAM,
+               0);
+
 
     if (client_socket < 0)
     {
         perror("socket");
+
         return 1;
     }
+
 
     printf("Client socket created successfully.\n");
 
 
-    /*
-     * Step 2: Prepare server address.
-     */
-    memset(&server_address, 0, sizeof(server_address));
+    /* Prepare server address. */
+    memset(&server_address,
+           0,
+           sizeof(server_address));
 
-    server_address.sin_family = AF_INET;
-    server_address.sin_port = htons(PORT);
+
+    server_address.sin_family =
+        AF_INET;
+
+    server_address.sin_port =
+        htons(PORT);
+
 
     if (inet_pton(AF_INET,
                   SERVER_IP,
@@ -55,12 +129,11 @@ int main(void)
     }
 
 
-    /*
-     * Step 3: Connect to server.
-     */
+    /* Connect to server. */
     printf("Connecting to server %s:%d...\n",
            SERVER_IP,
            PORT);
+
 
     if (connect(client_socket,
                 (struct sockaddr *)&server_address,
@@ -73,13 +146,13 @@ int main(void)
         return 1;
     }
 
+
     printf("Connected to NetMessenger server successfully!\n");
 
 
-    /*
-     * Step 4: REGISTER must be first command.
-     */
+    /* REGISTER */
     printf("Enter username: ");
+
 
     if (fgets(username,
               sizeof(username),
@@ -90,24 +163,16 @@ int main(void)
         return 1;
     }
 
-    /*
-     * Remove newline from username.
-     */
-    username[strcspn(username, "\n")] = '\0';
+
+    username[strcspn(username, "\r\n")] = '\0';
 
 
-    /*
-     * Build REGISTER command.
-     */
     snprintf(command,
              sizeof(command),
              "REGISTER %s\n",
              username);
 
 
-    /*
-     * Send REGISTER command.
-     */
     if (send(client_socket,
              command,
              strlen(command),
@@ -122,13 +187,15 @@ int main(void)
 
 
     /*
-     * Receive REGISTER response.
+     * Receive REGISTER response before
+     * starting receiver thread.
      */
     bytes_received =
         recv(client_socket,
              response,
              sizeof(response) - 1,
              0);
+
 
     if (bytes_received <= 0)
     {
@@ -139,15 +206,20 @@ int main(void)
         return 1;
     }
 
+
     response[bytes_received] = '\0';
 
-    printf("Server: %s", response);
+
+    printf("Server: %s",
+           response);
 
 
     /*
-     * If REGISTER failed, do not continue.
+     * Registration failed.
      */
-    if (strncmp(response, "OK REGISTERED", 13) != 0)
+    if (strncmp(response,
+                "OK REGISTERED",
+                13) != 0)
     {
         printf("Registration failed.\n");
 
@@ -158,13 +230,31 @@ int main(void)
 
 
     /*
-     * Step 5:
-     * Interactive command loop.
+     * Start background receiver thread.
      */
-    while (1)
+    if (pthread_create(&receiver_thread,
+                       NULL,
+                       receive_messages,
+                       &client_socket) != 0)
+    {
+        perror("pthread_create");
+
+        close(client_socket);
+
+        return 1;
+    }
+
+
+    /*
+     * Main thread:
+     * read and send commands.
+     */
+    while (client_running)
     {
         printf("> ");
+
         fflush(stdout);
+
 
         if (fgets(command,
                   sizeof(command),
@@ -174,9 +264,6 @@ int main(void)
         }
 
 
-        /*
-         * Send command to server.
-         */
         if (send(client_socket,
                  command,
                  strlen(command),
@@ -189,39 +276,41 @@ int main(void)
 
 
         /*
-         * Wait for server response.
+         * If user typed QUIT,
+         * allow server response briefly
+         * and then stop.
          */
-        bytes_received =
-            recv(client_socket,
-                 response,
-                 sizeof(response) - 1,
-                 0);
-
-        if (bytes_received <= 0)
+        if (strncmp(command,
+                    "QUIT",
+                    4) == 0)
         {
-            printf("Server disconnected.\n");
+            sleep(1);
 
-            break;
-        }
+            client_running = 0;
 
-        response[bytes_received] = '\0';
-
-        printf("Server: %s", response);
-
-
-        /*
-         * QUIT ends the client.
-         */
-        if (strncmp(command, "QUIT", 4) == 0)
-        {
             break;
         }
     }
 
 
+    /*
+     * Stop receiver thread.
+     */
+    client_running = 0;
+
+    shutdown(client_socket,
+             SHUT_RDWR);
+
+
+    pthread_join(receiver_thread,
+                 NULL);
+
+
     close(client_socket);
 
+
     printf("Disconnected from server.\n");
+
 
     return 0;
 }
