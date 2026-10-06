@@ -11,13 +11,19 @@
 int main(void)
 {
     int client_socket;
-    char username[64];
-    char command[128];
-    char response[256];
-    ssize_t bytes_received;
+
     struct sockaddr_in server_address;
 
-    /* Step 1: Create a TCP socket */
+    char username[64];
+    char command[1024];
+    char response[1024];
+
+    ssize_t bytes_received;
+
+    /*
+     * Step 1:
+     * Create an IPv4 TCP socket.
+     */
     client_socket = socket(AF_INET, SOCK_STREAM, 0);
 
     if (client_socket < 0)
@@ -28,7 +34,10 @@ int main(void)
 
     printf("Client socket created successfully.\n");
 
-    /* Step 2: Prepare the server address */
+    /*
+     * Step 2:
+     * Prepare server address.
+     */
     memset(&server_address, 0, sizeof(server_address));
 
     server_address.sin_family = AF_INET;
@@ -43,7 +52,10 @@ int main(void)
         return 1;
     }
 
-    /* Step 3: Connect to the server */
+    /*
+     * Step 3:
+     * Connect to the NetMessenger server.
+     */
     printf("Connecting to server %s:%d...\n",
            SERVER_IP,
            PORT);
@@ -58,34 +70,105 @@ int main(void)
     }
 
     printf("Connected to NetMessenger server successfully!\n");
-printf("Enter username: ");
-scanf("%63s", username);
 
-snprintf(command,
-         sizeof(command),
-         "REGISTER %s\n",
-         username);
+    /*
+     * Step 4:
+     * REGISTER must be the first command.
+     */
+    printf("Enter username: ");
 
-send(client_socket,
-     command,
-     strlen(command),
-     0);
+    if (fgets(username, sizeof(username), stdin) == NULL)
+    {
+        close(client_socket);
+        return 1;
+    }
 
-bytes_received = recv(client_socket,
-                      response,
-                      sizeof(response) - 1,
-                      0);
+    username[strcspn(username, "\n")] = '\0';
 
-if (bytes_received > 0)
-{
+    snprintf(command,
+             sizeof(command),
+             "REGISTER %s\n",
+             username);
+
+    if (send(client_socket,
+             command,
+             strlen(command),
+             0) < 0)
+    {
+        perror("send");
+        close(client_socket);
+        return 1;
+    }
+
+    /*
+     * Receive REGISTER response.
+     */
+    bytes_received = recv(client_socket,
+                          response,
+                          sizeof(response) - 1,
+                          0);
+
+    if (bytes_received <= 0)
+    {
+        printf("Server disconnected.\n");
+        close(client_socket);
+        return 1;
+    }
+
     response[bytes_received] = '\0';
+
     printf("Server: %s", response);
-}
-else
-{
-    printf("Server disconnected.\n");
-}
+
+    /*
+     * Step 5:
+     * Keep the client connected.
+     *
+     * The user can now type protocol commands.
+     */
+    while (1)
+    {
+        printf("> ");
+
+        if (fgets(command,
+                  sizeof(command),
+                  stdin) == NULL)
+        {
+            break;
+        }
+
+        /*
+         * fgets() already keeps the newline,
+         * which matches our line-based protocol.
+         */
+        if (send(client_socket,
+                 command,
+                 strlen(command),
+                 0) < 0)
+        {
+            perror("send");
+            break;
+        }
+
+        /*
+         * QUIT will later be handled properly
+         * by the server.
+         */
+        if (strncmp(command, "QUIT", 4) == 0)
+        {
+            break;
+        }
+
+        /*
+         * At this intermediate stage the server
+         * does not yet send responses for LIST,
+         * BCAST, etc., so we do not call recv()
+         * here yet.
+         */
+    }
+
     close(client_socket);
+
+    printf("Disconnected from server.\n");
 
     return 0;
 }
