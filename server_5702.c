@@ -5,6 +5,9 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <pthread.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <errno.h>
 
 #define PORT 11702
 #define MAX_CLIENTS 10
@@ -12,6 +15,8 @@
 #define USERNAME_SIZE 64
 #define ROOM_NAME_SIZE 64
 #define BUFFER_SIZE 2048
+#define FILE_CHUNK 4096
+#define MAX_FILE_SIZE (10 * 1024 * 1024)
 
 typedef struct
 {
@@ -28,13 +33,94 @@ typedef struct
     int active;
 } Room;
 
-
-/* Shared data */
 Client clients[MAX_CLIENTS];
 Room rooms[MAX_ROOMS];
 
 pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t rooms_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+
+/* =========================================================
+   TCP HELPER FUNCTIONS
+   ========================================================= */
+
+ssize_t recv_line(int socket_fd, char *buffer, size_t max_size)
+{
+    size_t total = 0;
+    char ch;
+
+    while (total < max_size - 1)
+    {
+        ssize_t n = recv(socket_fd, &ch, 1, 0);
+
+        if (n <= 0)
+        {
+            return n;
+        }
+
+        if (ch == '\n')
+        {
+            break;
+        }
+
+        if (ch != '\r')
+        {
+            buffer[total++] = ch;
+        }
+    }
+
+    buffer[total] = '\0';
+
+    return (ssize_t)total;
+}
+
+
+int send_all(int socket_fd, const void *buffer, size_t size)
+{
+    const char *data = (const char *)buffer;
+    size_t total = 0;
+
+    while (total < size)
+    {
+        ssize_t n = send(socket_fd,
+                         data + total,
+                         size - total,
+                         0);
+
+        if (n <= 0)
+        {
+            return -1;
+        }
+
+        total += (size_t)n;
+    }
+
+    return 0;
+}
+
+
+int recv_exact(int socket_fd, void *buffer, size_t size)
+{
+    char *data = (char *)buffer;
+    size_t total = 0;
+
+    while (total < size)
+    {
+        ssize_t n = recv(socket_fd,
+                         data + total,
+                         size - total,
+                         0);
+
+        if (n <= 0)
+        {
+            return -1;
+        }
+
+        total += (size_t)n;
+    }
+
+    return 0;
+}
 
 
 /* =========================================================
@@ -58,7 +144,7 @@ int username_exists(const char *username)
 }
 
 
-int add_client(int socket, const char *username)
+int add_client(int socket_fd, const char *username)
 {
     int i;
 
@@ -66,14 +152,13 @@ int add_client(int socket, const char *username)
     {
         if (!clients[i].active)
         {
-            clients[i].socket = socket;
+            clients[i].socket = socket_fd;
 
             strncpy(clients[i].username,
                     username,
                     USERNAME_SIZE - 1);
 
             clients[i].username[USERNAME_SIZE - 1] = '\0';
-
             clients[i].active = 1;
 
             return 1;
@@ -84,7 +169,7 @@ int add_client(int socket, const char *username)
 }
 
 
-void remove_client(int socket)
+void remove_client(int socket_fd)
 {
     int i;
 
@@ -93,7 +178,7 @@ void remove_client(int socket)
     for (i = 0; i < MAX_CLIENTS; i++)
     {
         if (clients[i].active &&
-            clients[i].socket == socket)
+            clients[i].socket == socket_fd)
         {
             printf("Removing user: %s\n",
                    clients[i].username);
@@ -107,6 +192,29 @@ void remove_client(int socket)
     }
 
     pthread_mutex_unlock(&clients_mutex);
+}
+
+
+int find_user_socket(const char *username)
+{
+    int i;
+    int result = -1;
+
+    pthread_mutex_lock(&clients_mutex);
+
+    for (i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (clients[i].active &&
+            strcmp(clients[i].username, username) == 0)
+        {
+            result = clients[i].socket;
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&clients_mutex);
+
+    return result;
 }
 
 
@@ -147,7 +255,6 @@ int create_room(const char *room_name)
                     ROOM_NAME_SIZE - 1);
 
             rooms[i].name[ROOM_NAME_SIZE - 1] = '\0';
-
             rooms[i].member_count = 0;
 
             for (j = 0; j < MAX_CLIENTS; j++)
@@ -163,15 +270,13 @@ int create_room(const char *room_name)
 }
 
 
-int is_room_member(int room_index,
-                   int client_socket)
+int is_room_member(int room_index, int socket_fd)
 {
     int i;
 
     for (i = 0; i < MAX_CLIENTS; i++)
     {
-        if (rooms[room_index].member_sockets[i]
-            == client_socket)
+        if (rooms[room_index].member_sockets[i] == socket_fd)
         {
             return 1;
         }
@@ -181,13 +286,11 @@ int is_room_member(int room_index,
 }
 
 
-int add_room_member(int room_index,
-                    int client_socket)
+int add_room_member(int room_index, int socket_fd)
 {
     int i;
 
-    if (is_room_member(room_index,
-                       client_socket))
+    if (is_room_member(room_index, socket_fd))
     {
         return 1;
     }
@@ -196,9 +299,7 @@ int add_room_member(int room_index,
     {
         if (rooms[room_index].member_sockets[i] == -1)
         {
-            rooms[room_index].member_sockets[i]
-                = client_socket;
-
+            rooms[room_index].member_sockets[i] = socket_fd;
             rooms[room_index].member_count++;
 
             return 1;
@@ -209,15 +310,13 @@ int add_room_member(int room_index,
 }
 
 
-int remove_room_member(int room_index,
-                       int client_socket)
+int remove_room_member(int room_index, int socket_fd)
 {
     int i;
 
     for (i = 0; i < MAX_CLIENTS; i++)
     {
-        if (rooms[room_index].member_sockets[i]
-            == client_socket)
+        if (rooms[room_index].member_sockets[i] == socket_fd)
         {
             rooms[room_index].member_sockets[i] = -1;
 
@@ -234,11 +333,7 @@ int remove_room_member(int room_index,
 }
 
 
-/*
- * When a client disconnects,
- * remove that socket from every room.
- */
-void remove_client_from_all_rooms(int client_socket)
+void remove_client_from_all_rooms(int socket_fd)
 {
     int i;
 
@@ -248,8 +343,7 @@ void remove_client_from_all_rooms(int client_socket)
     {
         if (rooms[i].active)
         {
-            remove_room_member(i,
-                               client_socket);
+            remove_room_member(i, socket_fd);
         }
     }
 
@@ -261,7 +355,7 @@ void remove_client_from_all_rooms(int client_socket)
    LIST
    ========================================================= */
 
-void send_user_list(int client_socket)
+void send_user_list(int socket_fd)
 {
     char response[BUFFER_SIZE];
     int i;
@@ -283,10 +377,9 @@ void send_user_list(int client_socket)
 
     strcat(response, " NID:6957\n");
 
-    send(client_socket,
-         response,
-         strlen(response),
-         0);
+    send_all(socket_fd,
+             response,
+             strlen(response));
 }
 
 
@@ -295,7 +388,7 @@ void send_user_list(int client_socket)
    ========================================================= */
 
 void broadcast_message(int sender_socket,
-                       const char *from,
+                       const char *sender,
                        const char *message)
 {
     char event[BUFFER_SIZE];
@@ -304,23 +397,19 @@ void broadcast_message(int sender_socket,
     snprintf(event,
              sizeof(event),
              "MSG BCAST %s %s\n",
-             from,
+             sender,
              message);
 
     pthread_mutex_lock(&clients_mutex);
 
     for (i = 0; i < MAX_CLIENTS; i++)
     {
-        /*
-         * Assignment says broadcast to all OTHER clients.
-         */
         if (clients[i].active &&
             clients[i].socket != sender_socket)
         {
-            send(clients[i].socket,
-                 event,
-                 strlen(event),
-                 0);
+            send_all(clients[i].socket,
+                     event,
+                     strlen(event));
         }
     }
 
@@ -332,49 +421,42 @@ void broadcast_message(int sender_socket,
    PRIVATE MESSAGE
    ========================================================= */
 
-int private_message(const char *from,
+int private_message(const char *sender,
                     const char *target,
                     const char *message)
 {
     char event[BUFFER_SIZE];
-    int i;
+    int target_socket;
+
+    target_socket = find_user_socket(target);
+
+    if (target_socket == -1)
+    {
+        return 0;
+    }
 
     snprintf(event,
              sizeof(event),
              "MSG PRIV %s %s\n",
-             from,
+             sender,
              message);
 
-    pthread_mutex_lock(&clients_mutex);
-
-    for (i = 0; i < MAX_CLIENTS; i++)
-    {
-        if (clients[i].active &&
-            strcmp(clients[i].username,
-                   target) == 0)
-        {
-            send(clients[i].socket,
+    if (send_all(target_socket,
                  event,
-                 strlen(event),
-                 0);
-
-            pthread_mutex_unlock(&clients_mutex);
-
-            return 1;
-        }
+                 strlen(event)) < 0)
+    {
+        return 0;
     }
 
-    pthread_mutex_unlock(&clients_mutex);
-
-    return 0;
+    return 1;
 }
 
 
 /* =========================================================
-   ROOMS COMMAND
+   ROOMS
    ========================================================= */
 
-void send_rooms(int client_socket)
+void send_rooms(int socket_fd)
 {
     char response[BUFFER_SIZE];
     int i;
@@ -393,8 +475,7 @@ void send_rooms(int client_socket)
                 strcat(response, ",");
             }
 
-            strcat(response,
-                   rooms[i].name);
+            strcat(response, rooms[i].name);
 
             first = 0;
         }
@@ -402,19 +483,13 @@ void send_rooms(int client_socket)
 
     pthread_mutex_unlock(&rooms_mutex);
 
-    strcat(response,
-           " NID:6957\n");
+    strcat(response, " NID:6957\n");
 
-    send(client_socket,
-         response,
-         strlen(response),
-         0);
+    send_all(socket_fd,
+             response,
+             strlen(response));
 }
 
-
-/* =========================================================
-   ROOM MESSAGE
-   ========================================================= */
 
 void send_room_message(int room_index,
                        int sender_socket,
@@ -434,15 +509,325 @@ void send_room_message(int room_index,
     for (i = 0; i < MAX_CLIENTS; i++)
     {
         if (rooms[room_index].member_sockets[i] != -1 &&
-            rooms[room_index].member_sockets[i]
-                != sender_socket)
+            rooms[room_index].member_sockets[i] != sender_socket)
         {
-            send(rooms[room_index].member_sockets[i],
-                 event,
-                 strlen(event),
-                 0);
+            send_all(rooms[room_index].member_sockets[i],
+                     event,
+                     strlen(event));
         }
     }
+}
+
+
+/* =========================================================
+   FILE STORAGE
+   ========================================================= */
+
+void make_storage_directories(const char *sender)
+{
+    char path[512];
+
+    mkdir("storage", 0755);
+
+    mkdir("storage/IT23695702", 0755);
+
+    snprintf(path,
+             sizeof(path),
+             "storage/IT23695702/%s",
+             sender);
+
+    mkdir(path, 0755);
+}
+
+
+int safe_filename(const char *filename)
+{
+    if (filename == NULL ||
+        filename[0] == '\0')
+    {
+        return 0;
+    }
+
+    if (strstr(filename, "..") != NULL ||
+        strchr(filename, '/') != NULL ||
+        strchr(filename, '\\') != NULL)
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+
+/* =========================================================
+   SENDFILE
+   ========================================================= */
+
+void handle_sendfile(int sender_socket,
+                     const char *sender,
+                     const char *command)
+{
+    char target[USERNAME_SIZE];
+    char filename[256];
+
+    long long file_size_ll;
+    size_t file_size;
+
+    char *file_data = NULL;
+
+    char storage_path[1024];
+    char file_header[1024];
+    char response[1024];
+
+    FILE *file;
+
+    int target_socket;
+
+
+    if (sscanf(command,
+               "SENDFILE %63s %255s %lld",
+               target,
+               filename,
+               &file_size_ll) != 3)
+    {
+        const char *error =
+            "ERR 005 INVALID_COMMAND NID:6957\n";
+
+        send_all(sender_socket,
+                 error,
+                 strlen(error));
+
+        return;
+    }
+
+
+    if (!safe_filename(filename))
+    {
+        const char *error =
+            "ERR 005 INVALID_COMMAND NID:6957\n";
+
+        send_all(sender_socket,
+                 error,
+                 strlen(error));
+
+        return;
+    }
+
+
+    if (file_size_ll < 0 ||
+        file_size_ll > MAX_FILE_SIZE)
+    {
+        const char *error =
+            "ERR 005 INVALID_FILE_SIZE NID:6957\n";
+
+        send_all(sender_socket,
+                 error,
+                 strlen(error));
+
+        return;
+    }
+
+
+    file_size = (size_t)file_size_ll;
+
+
+    /*
+     * Allocate at least one byte so a zero-size
+     * file is also handled safely.
+     */
+    file_data = malloc(file_size > 0 ? file_size : 1);
+
+    if (file_data == NULL)
+    {
+        const char *error =
+            "ERR 005 SERVER_ERROR NID:6957\n";
+
+        send_all(sender_socket,
+                 error,
+                 strlen(error));
+
+        return;
+    }
+
+
+    /*
+     * IMPORTANT:
+     * Receive exactly the number of raw bytes
+     * declared in the SENDFILE header.
+     */
+    if (file_size > 0 &&
+        recv_exact(sender_socket,
+                   file_data,
+                   file_size) < 0)
+    {
+        printf("File receive failed from %s.\n",
+               sender);
+
+        free(file_data);
+
+        return;
+    }
+
+
+    /*
+     * Check whether target is currently online.
+     */
+    target_socket = find_user_socket(target);
+
+    if (target_socket == -1)
+    {
+        const char *error =
+            "ERR 002 USER_NOT_FOUND NID:6957\n";
+
+        send_all(sender_socket,
+                 error,
+                 strlen(error));
+
+        free(file_data);
+
+        return;
+    }
+
+
+    /*
+     * Create:
+     * storage/IT23695702/<sender>/
+     */
+    make_storage_directories(sender);
+
+
+    snprintf(storage_path,
+             sizeof(storage_path),
+             "storage/IT23695702/%s/%s",
+             sender,
+             filename);
+
+
+    file = fopen(storage_path, "wb");
+
+    if (file == NULL)
+    {
+        perror("fopen");
+
+        {
+            const char *error =
+                "ERR 005 SERVER_ERROR NID:6957\n";
+
+            send_all(sender_socket,
+                     error,
+                     strlen(error));
+        }
+
+        free(file_data);
+
+        return;
+    }
+
+
+    if (file_size > 0)
+    {
+        if (fwrite(file_data,
+                   1,
+                   file_size,
+                   file) != file_size)
+        {
+            fclose(file);
+
+            free(file_data);
+
+            {
+                const char *error =
+                    "ERR 005 SERVER_ERROR NID:6957\n";
+
+                send_all(sender_socket,
+                         error,
+                         strlen(error));
+            }
+
+            return;
+        }
+    }
+
+
+    fclose(file);
+
+
+    printf("File stored: %s (%zu bytes)\n",
+           storage_path,
+           file_size);
+
+
+    /*
+     * Forward header to recipient.
+     */
+    snprintf(file_header,
+             sizeof(file_header),
+             "FILE %s %s %zu\n",
+             sender,
+             filename,
+             file_size);
+
+
+    if (send_all(target_socket,
+                 file_header,
+                 strlen(file_header)) < 0)
+    {
+        const char *error =
+            "ERR 002 USER_NOT_FOUND NID:6957\n";
+
+        send_all(sender_socket,
+                 error,
+                 strlen(error));
+
+        free(file_data);
+
+        return;
+    }
+
+
+    /*
+     * Forward exact raw file bytes.
+     */
+    if (file_size > 0)
+    {
+        if (send_all(target_socket,
+                     file_data,
+                     file_size) < 0)
+        {
+            const char *error =
+                "ERR 002 USER_NOT_FOUND NID:6957\n";
+
+            send_all(sender_socket,
+                     error,
+                     strlen(error));
+
+            free(file_data);
+
+            return;
+        }
+    }
+
+
+    snprintf(response,
+             sizeof(response),
+             "OK FILESENT %s %s NID:6957\n",
+             target,
+             filename);
+
+
+    send_all(sender_socket,
+             response,
+             strlen(response));
+
+
+    printf("File sent: %s -> %s : %s (%zu bytes)\n",
+           sender,
+           target,
+           filename,
+           file_size);
+
+
+    free(file_data);
 }
 
 
@@ -463,6 +848,7 @@ void *handle_client(void *arg)
 
     free(arg);
 
+
     printf("Client thread started.\n");
 
 
@@ -470,15 +856,11 @@ void *handle_client(void *arg)
        REGISTER
        ===================================================== */
 
-    memset(buffer,
-           0,
-           sizeof(buffer));
-
     bytes_received =
-        recv(client_socket,
-             buffer,
-             sizeof(buffer) - 1,
-             0);
+        recv_line(client_socket,
+                  buffer,
+                  sizeof(buffer));
+
 
     if (bytes_received <= 0)
     {
@@ -486,11 +868,6 @@ void *handle_client(void *arg)
 
         return NULL;
     }
-
-    buffer[bytes_received] = '\0';
-
-    buffer[strcspn(buffer,
-                   "\r\n")] = '\0';
 
 
     if (strncmp(buffer,
@@ -500,10 +877,9 @@ void *handle_client(void *arg)
         const char *error =
             "ERR 005 REGISTER_REQUIRED NID:6957\n";
 
-        send(client_socket,
-             error,
-             strlen(error),
-             0);
+        send_all(client_socket,
+                 error,
+                 strlen(error));
 
         close(client_socket);
 
@@ -518,10 +894,9 @@ void *handle_client(void *arg)
         const char *error =
             "ERR 005 INVALID_REGISTER NID:6957\n";
 
-        send(client_socket,
-             error,
-             strlen(error),
-             0);
+        send_all(client_socket,
+                 error,
+                 strlen(error));
 
         close(client_socket);
 
@@ -536,13 +911,14 @@ void *handle_client(void *arg)
     {
         pthread_mutex_unlock(&clients_mutex);
 
-        const char *error =
-            "ERR 001 USERNAME_TAKEN NID:6957\n";
+        {
+            const char *error =
+                "ERR 001 USERNAME_TAKEN NID:6957\n";
 
-        send(client_socket,
-             error,
-             strlen(error),
-             0);
+            send_all(client_socket,
+                     error,
+                     strlen(error));
+        }
 
         close(client_socket);
 
@@ -555,13 +931,14 @@ void *handle_client(void *arg)
     {
         pthread_mutex_unlock(&clients_mutex);
 
-        const char *error =
-            "ERR 005 SERVER_FULL NID:6957\n";
+        {
+            const char *error =
+                "ERR 005 SERVER_FULL NID:6957\n";
 
-        send(client_socket,
-             error,
-             strlen(error),
-             0);
+            send_all(client_socket,
+                     error,
+                     strlen(error));
+        }
 
         close(client_socket);
 
@@ -582,10 +959,9 @@ void *handle_client(void *arg)
                  "OK REGISTERED %s NID:6957\n",
                  username);
 
-        send(client_socket,
-             response,
-             strlen(response),
-             0);
+        send_all(client_socket,
+                 response,
+                 strlen(response));
     }
 
 
@@ -599,15 +975,10 @@ void *handle_client(void *arg)
 
     while (1)
     {
-        memset(buffer,
-               0,
-               sizeof(buffer));
-
         bytes_received =
-            recv(client_socket,
-                 buffer,
-                 sizeof(buffer) - 1,
-                 0);
+            recv_line(client_socket,
+                      buffer,
+                      sizeof(buffer));
 
 
         if (bytes_received <= 0)
@@ -619,12 +990,6 @@ void *handle_client(void *arg)
         }
 
 
-        buffer[bytes_received] = '\0';
-
-        buffer[strcspn(buffer,
-                       "\r\n")] = '\0';
-
-
         printf("Command from %s: %s\n",
                username,
                buffer);
@@ -632,8 +997,7 @@ void *handle_client(void *arg)
 
         /* ================= LIST ================= */
 
-        if (strcmp(buffer,
-                   "LIST") == 0)
+        if (strcmp(buffer, "LIST") == 0)
         {
             send_user_list(client_socket);
         }
@@ -645,37 +1009,31 @@ void *handle_client(void *arg)
                          "BCAST ",
                          6) == 0)
         {
-            char *message =
-                buffer + 6;
-
+            char *message = buffer + 6;
 
             if (*message == '\0')
             {
                 const char *error =
                     "ERR 005 INVALID_COMMAND NID:6957\n";
 
-                send(client_socket,
-                     error,
-                     strlen(error),
-                     0);
+                send_all(client_socket,
+                         error,
+                         strlen(error));
 
                 continue;
             }
-
 
             broadcast_message(client_socket,
                               username,
                               message);
 
-
             {
                 const char *response =
                     "OK SENT NID:6957\n";
 
-                send(client_socket,
-                     response,
-                     strlen(response),
-                     0);
+                send_all(client_socket,
+                         response,
+                         strlen(response));
             }
         }
 
@@ -689,7 +1047,6 @@ void *handle_client(void *arg)
             char target[USERNAME_SIZE];
             char message[BUFFER_SIZE];
 
-
             if (sscanf(buffer + 5,
                        "%63s %2047[^\n]",
                        target,
@@ -698,10 +1055,9 @@ void *handle_client(void *arg)
                 const char *error =
                     "ERR 005 INVALID_COMMAND NID:6957\n";
 
-                send(client_socket,
-                     error,
-                     strlen(error),
-                     0);
+                send_all(client_socket,
+                         error,
+                         strlen(error));
 
                 continue;
             }
@@ -714,20 +1070,18 @@ void *handle_client(void *arg)
                 const char *response =
                     "OK SENT NID:6957\n";
 
-                send(client_socket,
-                     response,
-                     strlen(response),
-                     0);
+                send_all(client_socket,
+                         response,
+                         strlen(response));
             }
             else
             {
                 const char *error =
                     "ERR 002 USER_NOT_FOUND NID:6957\n";
 
-                send(client_socket,
-                     error,
-                     strlen(error),
-                     0);
+                send_all(client_socket,
+                         error,
+                         strlen(error));
             }
         }
 
@@ -741,7 +1095,6 @@ void *handle_client(void *arg)
             char room_name[ROOM_NAME_SIZE];
             int room_index;
 
-
             if (sscanf(buffer + 5,
                        "%63s",
                        room_name) != 1)
@@ -749,10 +1102,9 @@ void *handle_client(void *arg)
                 const char *error =
                     "ERR 005 INVALID_COMMAND NID:6957\n";
 
-                send(client_socket,
-                     error,
-                     strlen(error),
-                     0);
+                send_all(client_socket,
+                         error,
+                         strlen(error));
 
                 continue;
             }
@@ -760,14 +1112,10 @@ void *handle_client(void *arg)
 
             pthread_mutex_lock(&rooms_mutex);
 
-
             room_index =
                 find_room(room_name);
 
 
-            /*
-             * JOIN creates room if necessary.
-             */
             if (room_index == -1)
             {
                 room_index =
@@ -779,13 +1127,14 @@ void *handle_client(void *arg)
             {
                 pthread_mutex_unlock(&rooms_mutex);
 
-                const char *error =
-                    "ERR 005 SERVER_FULL NID:6957\n";
+                {
+                    const char *error =
+                        "ERR 005 SERVER_FULL NID:6957\n";
 
-                send(client_socket,
-                     error,
-                     strlen(error),
-                     0);
+                    send_all(client_socket,
+                             error,
+                             strlen(error));
+                }
 
                 continue;
             }
@@ -793,7 +1142,6 @@ void *handle_client(void *arg)
 
             add_room_member(room_index,
                             client_socket);
-
 
             pthread_mutex_unlock(&rooms_mutex);
 
@@ -806,10 +1154,9 @@ void *handle_client(void *arg)
                          "OK JOINED %s NID:6957\n",
                          room_name);
 
-                send(client_socket,
-                     response,
-                     strlen(response),
-                     0);
+                send_all(client_socket,
+                         response,
+                         strlen(response));
             }
 
 
@@ -836,17 +1183,15 @@ void *handle_client(void *arg)
                 const char *error =
                     "ERR 005 INVALID_COMMAND NID:6957\n";
 
-                send(client_socket,
-                     error,
-                     strlen(error),
-                     0);
+                send_all(client_socket,
+                         error,
+                         strlen(error));
 
                 continue;
             }
 
 
             pthread_mutex_lock(&rooms_mutex);
-
 
             room_index =
                 find_room(room_name);
@@ -856,13 +1201,14 @@ void *handle_client(void *arg)
             {
                 pthread_mutex_unlock(&rooms_mutex);
 
-                const char *error =
-                    "ERR 003 ROOM_NOT_FOUND NID:6957\n";
+                {
+                    const char *error =
+                        "ERR 003 ROOM_NOT_FOUND NID:6957\n";
 
-                send(client_socket,
-                     error,
-                     strlen(error),
-                     0);
+                    send_all(client_socket,
+                             error,
+                             strlen(error));
+                }
 
                 continue;
             }
@@ -870,7 +1216,6 @@ void *handle_client(void *arg)
 
             remove_room_member(room_index,
                                client_socket);
-
 
             pthread_mutex_unlock(&rooms_mutex);
 
@@ -883,10 +1228,9 @@ void *handle_client(void *arg)
                          "OK LEFT %s NID:6957\n",
                          room_name);
 
-                send(client_socket,
-                     response,
-                     strlen(response),
-                     0);
+                send_all(client_socket,
+                         response,
+                         strlen(response));
             }
 
 
@@ -913,7 +1257,6 @@ void *handle_client(void *arg)
         {
             char room_name[ROOM_NAME_SIZE];
             char message[BUFFER_SIZE];
-
             int room_index;
 
 
@@ -925,17 +1268,15 @@ void *handle_client(void *arg)
                 const char *error =
                     "ERR 005 INVALID_COMMAND NID:6957\n";
 
-                send(client_socket,
-                     error,
-                     strlen(error),
-                     0);
+                send_all(client_socket,
+                         error,
+                         strlen(error));
 
                 continue;
             }
 
 
             pthread_mutex_lock(&rooms_mutex);
-
 
             room_index =
                 find_room(room_name);
@@ -945,33 +1286,32 @@ void *handle_client(void *arg)
             {
                 pthread_mutex_unlock(&rooms_mutex);
 
-                const char *error =
-                    "ERR 003 ROOM_NOT_FOUND NID:6957\n";
+                {
+                    const char *error =
+                        "ERR 003 ROOM_NOT_FOUND NID:6957\n";
 
-                send(client_socket,
-                     error,
-                     strlen(error),
-                     0);
+                    send_all(client_socket,
+                             error,
+                             strlen(error));
+                }
 
                 continue;
             }
 
 
-            /*
-             * Sender must belong to room.
-             */
             if (!is_room_member(room_index,
                                 client_socket))
             {
                 pthread_mutex_unlock(&rooms_mutex);
 
-                const char *error =
-                    "ERR 003 ROOM_NOT_FOUND NID:6957\n";
+                {
+                    const char *error =
+                        "ERR 003 ROOM_NOT_FOUND NID:6957\n";
 
-                send(client_socket,
-                     error,
-                     strlen(error),
-                     0);
+                    send_all(client_socket,
+                             error,
+                             strlen(error));
+                }
 
                 continue;
             }
@@ -982,7 +1322,6 @@ void *handle_client(void *arg)
                               username,
                               message);
 
-
             pthread_mutex_unlock(&rooms_mutex);
 
 
@@ -990,11 +1329,22 @@ void *handle_client(void *arg)
                 const char *response =
                     "OK SENT NID:6957\n";
 
-                send(client_socket,
-                     response,
-                     strlen(response),
-                     0);
+                send_all(client_socket,
+                         response,
+                         strlen(response));
             }
+        }
+
+
+        /* ================= SENDFILE ================= */
+
+        else if (strncmp(buffer,
+                         "SENDFILE ",
+                         9) == 0)
+        {
+            handle_sendfile(client_socket,
+                            username,
+                            buffer);
         }
 
 
@@ -1006,10 +1356,9 @@ void *handle_client(void *arg)
             const char *response =
                 "OK BYE NID:6957\n";
 
-            send(client_socket,
-                 response,
-                 strlen(response),
-                 0);
+            send_all(client_socket,
+                     response,
+                     strlen(response));
 
             break;
         }
@@ -1022,15 +1371,13 @@ void *handle_client(void *arg)
             const char *error =
                 "ERR 005 INVALID_COMMAND NID:6957\n";
 
-            send(client_socket,
-                 error,
-                 strlen(error),
-                 0);
+            send_all(client_socket,
+                     error,
+                     strlen(error));
         }
     }
 
 
-    /* Remove client from rooms first. */
     remove_client_from_all_rooms(client_socket);
 
 
@@ -1064,6 +1411,8 @@ int main(void)
 
     socklen_t client_length;
 
+    int reuse = 1;
+
 
     memset(clients,
            0,
@@ -1086,6 +1435,16 @@ int main(void)
 
         return 1;
     }
+
+
+    /*
+     * Allows quick server restart after testing.
+     */
+    setsockopt(server_socket,
+               SOL_SOCKET,
+               SO_REUSEADDR,
+               &reuse,
+               sizeof(reuse));
 
 
     printf("Server socket created successfully.\n");
@@ -1140,7 +1499,6 @@ int main(void)
     while (1)
     {
         int *client_socket_ptr;
-
         pthread_t thread_id;
 
 
