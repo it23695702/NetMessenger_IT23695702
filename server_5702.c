@@ -20,12 +20,13 @@ typedef struct
 
 Client clients[MAX_CLIENTS];
 
-pthread_mutex_t clients_mutex =
-    PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 
-/* Check whether username already exists.
-   Caller must hold clients_mutex. */
+/* ---------------------------------------------------------
+   Check whether username already exists.
+   Caller must hold clients_mutex.
+   --------------------------------------------------------- */
 int username_exists(const char *username)
 {
     int i;
@@ -43,8 +44,10 @@ int username_exists(const char *username)
 }
 
 
-/* Add client to shared table.
-   Caller must hold clients_mutex. */
+/* ---------------------------------------------------------
+   Add a registered client.
+   Caller must hold clients_mutex.
+   --------------------------------------------------------- */
 int add_client(int socket, const char *username)
 {
     int i;
@@ -71,7 +74,9 @@ int add_client(int socket, const char *username)
 }
 
 
-/* Remove disconnected client. */
+/* ---------------------------------------------------------
+   Remove disconnected client.
+   --------------------------------------------------------- */
 void remove_client(int socket)
 {
     int i;
@@ -98,7 +103,12 @@ void remove_client(int socket)
 }
 
 
-/* Send connected user list. */
+/* ---------------------------------------------------------
+   Send list of currently connected users.
+
+   Response:
+   USERS <u1> <u2> ... NID:6957
+   --------------------------------------------------------- */
 void send_user_list(int client_socket)
 {
     char response[BUFFER_SIZE];
@@ -133,11 +143,12 @@ void send_user_list(int client_socket)
 }
 
 
-/*
- * Broadcast a message to every connected client.
- *
- * EVENT BCAST <from> <message>
- */
+/* ---------------------------------------------------------
+   Broadcast message to all connected clients.
+
+   Event:
+   EVENT BCAST <from> <message>
+   --------------------------------------------------------- */
 void broadcast_message(const char *from,
                        const char *message)
 {
@@ -167,7 +178,58 @@ void broadcast_message(const char *from,
 }
 
 
-/* Handle one client connection. */
+/* ---------------------------------------------------------
+   Send private message to one connected user.
+
+   Event:
+   EVENT PMSG <from> <message>
+
+   Return:
+   1 = target found
+   0 = target not found
+   --------------------------------------------------------- */
+int private_message(const char *from,
+                    const char *target,
+                    const char *message)
+{
+    char event[BUFFER_SIZE];
+    int i;
+    int found = 0;
+
+    snprintf(event,
+             sizeof(event),
+             "EVENT PMSG %s %s\n",
+             from,
+             message);
+
+    pthread_mutex_lock(&clients_mutex);
+
+    for (i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (clients[i].active &&
+            strcmp(clients[i].username, target) == 0)
+        {
+            send(clients[i].socket,
+                 event,
+                 strlen(event),
+                 0);
+
+            found = 1;
+
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&clients_mutex);
+
+    return found;
+}
+
+
+/* ---------------------------------------------------------
+   Handle one connected client.
+   Each client is handled by a separate pthread.
+   --------------------------------------------------------- */
 void *handle_client(void *arg)
 {
     int client_socket = *((int *)arg);
@@ -184,9 +246,10 @@ void *handle_client(void *arg)
     printf("Client thread started.\n");
 
 
-    /* =====================================
+    /* =====================================================
        REGISTER
-       ===================================== */
+       First command must be REGISTER <username>
+       ===================================================== */
 
     memset(buffer, 0, sizeof(buffer));
 
@@ -244,8 +307,11 @@ void *handle_client(void *arg)
     }
 
 
-    pthread_mutex_lock(&clients_mutex);
+    /* =====================================================
+       CHECK DUPLICATE USERNAME
+       ===================================================== */
 
+    pthread_mutex_lock(&clients_mutex);
 
     if (username_exists(username))
     {
@@ -285,12 +351,12 @@ void *handle_client(void *arg)
         return NULL;
     }
 
-
     pthread_mutex_unlock(&clients_mutex);
 
     registered = 1;
 
 
+    /* REGISTER successful response */
     {
         char response[256];
 
@@ -310,9 +376,9 @@ void *handle_client(void *arg)
            username);
 
 
-    /* =====================================
+    /* =====================================================
        COMMAND LOOP
-       ===================================== */
+       ===================================================== */
 
     while (1)
     {
@@ -323,7 +389,6 @@ void *handle_client(void *arg)
                  buffer,
                  sizeof(buffer) - 1,
                  0);
-
 
         if (bytes_received <= 0)
         {
@@ -341,28 +406,29 @@ void *handle_client(void *arg)
                buffer);
 
 
-        /* Remove newline characters. */
+        /*
+         * Remove \n or \r\n from command.
+         */
         buffer[strcspn(buffer, "\r\n")] = '\0';
 
 
-        /* =================================
+        /* =================================================
            LIST
-           ================================= */
+           ================================================= */
         if (strcmp(buffer, "LIST") == 0)
         {
             send_user_list(client_socket);
         }
 
 
-        /* =================================
-           BCAST
-           ================================= */
+        /* =================================================
+           BCAST <message>
+           ================================================= */
         else if (strncmp(buffer,
                          "BCAST ",
                          6) == 0)
         {
             char *message = buffer + 6;
-
 
             if (strlen(message) == 0)
             {
@@ -379,8 +445,7 @@ void *handle_client(void *arg)
 
 
             /*
-             * First send acknowledgement
-             * to the sender.
+             * Acknowledge sender.
              */
             {
                 const char *response =
@@ -394,8 +459,7 @@ void *handle_client(void *arg)
 
 
             /*
-             * Then deliver EVENT BCAST
-             * to all connected clients.
+             * Send event to all connected clients.
              */
             broadcast_message(username,
                               message);
@@ -407,9 +471,86 @@ void *handle_client(void *arg)
         }
 
 
-        /* =================================
+        /* =================================================
+           PMSG <user> <message>
+           ================================================= */
+        else if (strncmp(buffer,
+                         "PMSG ",
+                         5) == 0)
+        {
+            char target[USERNAME_SIZE];
+            char message[BUFFER_SIZE];
+
+            /*
+             * Example:
+             *
+             * PMSG Ravi Hello Ravi
+             *
+             * target  = Ravi
+             * message = Hello Ravi
+             */
+            if (sscanf(buffer + 5,
+                       "%63s %1019[^\n]",
+                       target,
+                       message) != 2)
+            {
+                const char *error =
+                    "ERR 005 INVALID_PMSG NID:6957\n";
+
+                send(client_socket,
+                     error,
+                     strlen(error),
+                     0);
+
+                continue;
+            }
+
+
+            /*
+             * Try to deliver private message.
+             */
+            if (private_message(username,
+                                target,
+                                message))
+            {
+                char response[256];
+
+                snprintf(response,
+                         sizeof(response),
+                         "OK PMSG %s NID:6957\n",
+                         target);
+
+                send(client_socket,
+                     response,
+                     strlen(response),
+                     0);
+
+
+                printf("Private message from %s to %s: %s\n",
+                       username,
+                       target,
+                       message);
+            }
+            else
+            {
+                const char *error =
+                    "ERR 002 USER_NOT_FOUND NID:6957\n";
+
+                send(client_socket,
+                     error,
+                     strlen(error),
+                     0);
+
+
+                printf("PMSG target not found: %s\n",
+                       target);
+            }
+        }
+
+
+        /* =================================================
            QUIT
-           ================================= */
+           ================================================= */
         else if (strcmp(buffer, "QUIT") == 0)
         {
             const char *response =
@@ -420,6 +561,7 @@ void *handle_client(void *arg)
                  strlen(response),
                  0);
 
+
             printf("%s requested QUIT.\n",
                    username);
 
@@ -427,9 +569,9 @@ void *handle_client(void *arg)
         }
 
 
-        /* =================================
-           UNKNOWN COMMAND
-           ================================= */
+        /* =================================================
+           UNKNOWN / NOT YET IMPLEMENTED
+           ================================================= */
         else
         {
             const char *error =
@@ -443,6 +585,9 @@ void *handle_client(void *arg)
     }
 
 
+    /*
+     * Remove user from connected-user table.
+     */
     if (registered)
     {
         remove_client(client_socket);
@@ -451,12 +596,17 @@ void *handle_client(void *arg)
 
     close(client_socket);
 
+
     printf("Client thread finished.\n");
+
 
     return NULL;
 }
 
 
+/* =========================================================
+   MAIN SERVER
+   ========================================================= */
 int main(void)
 {
     int server_socket;
@@ -467,10 +617,18 @@ int main(void)
     socklen_t client_length;
 
 
-    memset(clients, 0, sizeof(clients));
+    /*
+     * Initialise shared client table.
+     */
+    memset(clients,
+           0,
+           sizeof(clients));
 
 
-    /* Create TCP socket. */
+    /* =====================================================
+       STEP 1 — CREATE TCP SOCKET
+       ===================================================== */
+
     server_socket =
         socket(AF_INET,
                SOCK_STREAM,
@@ -488,22 +646,31 @@ int main(void)
     printf("Server socket created successfully.\n");
 
 
-    /* Prepare server address. */
+    /* =====================================================
+       STEP 2 — PREPARE SERVER ADDRESS
+       ===================================================== */
+
     memset(&server_address,
            0,
            sizeof(server_address));
 
 
-    server_address.sin_family = AF_INET;
+    server_address.sin_family =
+        AF_INET;
+
 
     server_address.sin_addr.s_addr =
         INADDR_ANY;
+
 
     server_address.sin_port =
         htons(PORT);
 
 
-    /* Bind to personalised port. */
+    /* =====================================================
+       STEP 3 — BIND
+       ===================================================== */
+
     if (bind(server_socket,
              (struct sockaddr *)&server_address,
              sizeof(server_address)) < 0)
@@ -520,7 +687,10 @@ int main(void)
            PORT);
 
 
-    /* Listen for clients. */
+    /* =====================================================
+       STEP 4 — LISTEN
+       ===================================================== */
+
     if (listen(server_socket,
                MAX_CLIENTS) < 0)
     {
@@ -536,7 +706,10 @@ int main(void)
            PORT);
 
 
-    /* Accept clients continuously. */
+    /* =====================================================
+       STEP 5 — ACCEPT CLIENTS CONTINUOUSLY
+       ===================================================== */
+
     while (1)
     {
         int *client_socket_ptr;
@@ -579,6 +752,9 @@ int main(void)
         printf("A client connected successfully!\n");
 
 
+        /*
+         * Create one worker thread per client.
+         */
         if (pthread_create(&thread_id,
                            NULL,
                            handle_client,
@@ -594,6 +770,9 @@ int main(void)
         }
 
 
+        /*
+         * Automatically release thread resources.
+         */
         pthread_detach(thread_id);
     }
 
