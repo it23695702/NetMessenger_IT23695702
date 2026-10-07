@@ -8,8 +8,10 @@
 
 #define PORT 11702
 #define MAX_CLIENTS 10
+#define MAX_ROOMS 10
 #define USERNAME_SIZE 64
-#define BUFFER_SIZE 1024
+#define ROOM_NAME_SIZE 64
+#define BUFFER_SIZE 2048
 
 typedef struct
 {
@@ -18,15 +20,27 @@ typedef struct
     int active;
 } Client;
 
+typedef struct
+{
+    char name[ROOM_NAME_SIZE];
+    int member_sockets[MAX_CLIENTS];
+    int member_count;
+    int active;
+} Room;
+
+
+/* Shared data */
 Client clients[MAX_CLIENTS];
+Room rooms[MAX_ROOMS];
 
 pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t rooms_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 
-/* ---------------------------------------------------------
-   Check whether username already exists.
-   Caller must hold clients_mutex.
-   --------------------------------------------------------- */
+/* =========================================================
+   CLIENT FUNCTIONS
+   ========================================================= */
+
 int username_exists(const char *username)
 {
     int i;
@@ -44,10 +58,6 @@ int username_exists(const char *username)
 }
 
 
-/* ---------------------------------------------------------
-   Add a registered client.
-   Caller must hold clients_mutex.
-   --------------------------------------------------------- */
 int add_client(int socket, const char *username)
 {
     int i;
@@ -74,9 +84,6 @@ int add_client(int socket, const char *username)
 }
 
 
-/* ---------------------------------------------------------
-   Remove disconnected client.
-   --------------------------------------------------------- */
 void remove_client(int socket)
 {
     int i;
@@ -103,18 +110,163 @@ void remove_client(int socket)
 }
 
 
-/* ---------------------------------------------------------
-   Send list of currently connected users.
+/* =========================================================
+   ROOM FUNCTIONS
+   ========================================================= */
 
-   Response:
-   USERS <u1> <u2> ... NID:6957
-   --------------------------------------------------------- */
+int find_room(const char *room_name)
+{
+    int i;
+
+    for (i = 0; i < MAX_ROOMS; i++)
+    {
+        if (rooms[i].active &&
+            strcmp(rooms[i].name, room_name) == 0)
+        {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+
+int create_room(const char *room_name)
+{
+    int i;
+    int j;
+
+    for (i = 0; i < MAX_ROOMS; i++)
+    {
+        if (!rooms[i].active)
+        {
+            rooms[i].active = 1;
+
+            strncpy(rooms[i].name,
+                    room_name,
+                    ROOM_NAME_SIZE - 1);
+
+            rooms[i].name[ROOM_NAME_SIZE - 1] = '\0';
+
+            rooms[i].member_count = 0;
+
+            for (j = 0; j < MAX_CLIENTS; j++)
+            {
+                rooms[i].member_sockets[j] = -1;
+            }
+
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+
+int is_room_member(int room_index,
+                   int client_socket)
+{
+    int i;
+
+    for (i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (rooms[room_index].member_sockets[i]
+            == client_socket)
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+int add_room_member(int room_index,
+                    int client_socket)
+{
+    int i;
+
+    if (is_room_member(room_index,
+                       client_socket))
+    {
+        return 1;
+    }
+
+    for (i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (rooms[room_index].member_sockets[i] == -1)
+        {
+            rooms[room_index].member_sockets[i]
+                = client_socket;
+
+            rooms[room_index].member_count++;
+
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+int remove_room_member(int room_index,
+                       int client_socket)
+{
+    int i;
+
+    for (i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (rooms[room_index].member_sockets[i]
+            == client_socket)
+        {
+            rooms[room_index].member_sockets[i] = -1;
+
+            if (rooms[room_index].member_count > 0)
+            {
+                rooms[room_index].member_count--;
+            }
+
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+/*
+ * When a client disconnects,
+ * remove that socket from every room.
+ */
+void remove_client_from_all_rooms(int client_socket)
+{
+    int i;
+
+    pthread_mutex_lock(&rooms_mutex);
+
+    for (i = 0; i < MAX_ROOMS; i++)
+    {
+        if (rooms[i].active)
+        {
+            remove_room_member(i,
+                               client_socket);
+        }
+    }
+
+    pthread_mutex_unlock(&rooms_mutex);
+}
+
+
+/* =========================================================
+   LIST
+   ========================================================= */
+
 void send_user_list(int client_socket)
 {
     char response[BUFFER_SIZE];
     int i;
 
-    strcpy(response, "USERS");
+    strcpy(response, "OK USERS");
 
     pthread_mutex_lock(&clients_mutex);
 
@@ -122,13 +274,8 @@ void send_user_list(int client_socket)
     {
         if (clients[i].active)
         {
-            if (strlen(response) +
-                strlen(clients[i].username) +
-                20 < sizeof(response))
-            {
-                strcat(response, " ");
-                strcat(response, clients[i].username);
-            }
+            strcat(response, " ");
+            strcat(response, clients[i].username);
         }
     }
 
@@ -143,13 +290,12 @@ void send_user_list(int client_socket)
 }
 
 
-/* ---------------------------------------------------------
-   Broadcast message to all connected clients.
+/* =========================================================
+   BCAST
+   ========================================================= */
 
-   Event:
-   EVENT BCAST <from> <message>
-   --------------------------------------------------------- */
-void broadcast_message(const char *from,
+void broadcast_message(int sender_socket,
+                       const char *from,
                        const char *message)
 {
     char event[BUFFER_SIZE];
@@ -157,7 +303,7 @@ void broadcast_message(const char *from,
 
     snprintf(event,
              sizeof(event),
-             "EVENT BCAST %s %s\n",
+             "MSG BCAST %s %s\n",
              from,
              message);
 
@@ -165,7 +311,11 @@ void broadcast_message(const char *from,
 
     for (i = 0; i < MAX_CLIENTS; i++)
     {
-        if (clients[i].active)
+        /*
+         * Assignment says broadcast to all OTHER clients.
+         */
+        if (clients[i].active &&
+            clients[i].socket != sender_socket)
         {
             send(clients[i].socket,
                  event,
@@ -178,27 +328,20 @@ void broadcast_message(const char *from,
 }
 
 
-/* ---------------------------------------------------------
-   Send private message to one connected user.
+/* =========================================================
+   PRIVATE MESSAGE
+   ========================================================= */
 
-   Event:
-   EVENT PMSG <from> <message>
-
-   Return:
-   1 = target found
-   0 = target not found
-   --------------------------------------------------------- */
 int private_message(const char *from,
                     const char *target,
                     const char *message)
 {
     char event[BUFFER_SIZE];
     int i;
-    int found = 0;
 
     snprintf(event,
              sizeof(event),
-             "EVENT PMSG %s %s\n",
+             "MSG PRIV %s %s\n",
              from,
              message);
 
@@ -207,29 +350,106 @@ int private_message(const char *from,
     for (i = 0; i < MAX_CLIENTS; i++)
     {
         if (clients[i].active &&
-            strcmp(clients[i].username, target) == 0)
+            strcmp(clients[i].username,
+                   target) == 0)
         {
             send(clients[i].socket,
                  event,
                  strlen(event),
                  0);
 
-            found = 1;
+            pthread_mutex_unlock(&clients_mutex);
 
-            break;
+            return 1;
         }
     }
 
     pthread_mutex_unlock(&clients_mutex);
 
-    return found;
+    return 0;
 }
 
 
-/* ---------------------------------------------------------
-   Handle one connected client.
-   Each client is handled by a separate pthread.
-   --------------------------------------------------------- */
+/* =========================================================
+   ROOMS COMMAND
+   ========================================================= */
+
+void send_rooms(int client_socket)
+{
+    char response[BUFFER_SIZE];
+    int i;
+    int first = 1;
+
+    strcpy(response, "OK ROOMS ");
+
+    pthread_mutex_lock(&rooms_mutex);
+
+    for (i = 0; i < MAX_ROOMS; i++)
+    {
+        if (rooms[i].active)
+        {
+            if (!first)
+            {
+                strcat(response, ",");
+            }
+
+            strcat(response,
+                   rooms[i].name);
+
+            first = 0;
+        }
+    }
+
+    pthread_mutex_unlock(&rooms_mutex);
+
+    strcat(response,
+           " NID:6957\n");
+
+    send(client_socket,
+         response,
+         strlen(response),
+         0);
+}
+
+
+/* =========================================================
+   ROOM MESSAGE
+   ========================================================= */
+
+void send_room_message(int room_index,
+                       int sender_socket,
+                       const char *sender,
+                       const char *message)
+{
+    char event[BUFFER_SIZE];
+    int i;
+
+    snprintf(event,
+             sizeof(event),
+             "MSG ROOM %s %s %s\n",
+             rooms[room_index].name,
+             sender,
+             message);
+
+    for (i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (rooms[room_index].member_sockets[i] != -1 &&
+            rooms[room_index].member_sockets[i]
+                != sender_socket)
+        {
+            send(rooms[room_index].member_sockets[i],
+                 event,
+                 strlen(event),
+                 0);
+        }
+    }
+}
+
+
+/* =========================================================
+   CLIENT THREAD
+   ========================================================= */
+
 void *handle_client(void *arg)
 {
     int client_socket = *((int *)arg);
@@ -248,10 +468,11 @@ void *handle_client(void *arg)
 
     /* =====================================================
        REGISTER
-       First command must be REGISTER <username>
        ===================================================== */
 
-    memset(buffer, 0, sizeof(buffer));
+    memset(buffer,
+           0,
+           sizeof(buffer));
 
     bytes_received =
         recv(client_socket,
@@ -261,8 +482,6 @@ void *handle_client(void *arg)
 
     if (bytes_received <= 0)
     {
-        printf("Client disconnected before registration.\n");
-
         close(client_socket);
 
         return NULL;
@@ -270,10 +489,13 @@ void *handle_client(void *arg)
 
     buffer[bytes_received] = '\0';
 
-    printf("Received: %s", buffer);
+    buffer[strcspn(buffer,
+                   "\r\n")] = '\0';
 
 
-    if (strncmp(buffer, "REGISTER ", 9) != 0)
+    if (strncmp(buffer,
+                "REGISTER ",
+                9) != 0)
     {
         const char *error =
             "ERR 005 REGISTER_REQUIRED NID:6957\n";
@@ -307,11 +529,8 @@ void *handle_client(void *arg)
     }
 
 
-    /* =====================================================
-       CHECK DUPLICATE USERNAME
-       ===================================================== */
-
     pthread_mutex_lock(&clients_mutex);
+
 
     if (username_exists(username))
     {
@@ -325,16 +544,14 @@ void *handle_client(void *arg)
              strlen(error),
              0);
 
-        printf("Username already taken: %s\n",
-               username);
-
         close(client_socket);
 
         return NULL;
     }
 
 
-    if (!add_client(client_socket, username))
+    if (!add_client(client_socket,
+                    username))
     {
         pthread_mutex_unlock(&clients_mutex);
 
@@ -351,12 +568,12 @@ void *handle_client(void *arg)
         return NULL;
     }
 
+
     pthread_mutex_unlock(&clients_mutex);
 
     registered = 1;
 
 
-    /* REGISTER successful response */
     {
         char response[256];
 
@@ -382,7 +599,9 @@ void *handle_client(void *arg)
 
     while (1)
     {
-        memset(buffer, 0, sizeof(buffer));
+        memset(buffer,
+               0,
+               sizeof(buffer));
 
         bytes_received =
             recv(client_socket,
@@ -390,9 +609,10 @@ void *handle_client(void *arg)
                  sizeof(buffer) - 1,
                  0);
 
+
         if (bytes_received <= 0)
         {
-            printf("Client %s disconnected.\n",
+            printf("%s disconnected.\n",
                    username);
 
             break;
@@ -401,39 +621,38 @@ void *handle_client(void *arg)
 
         buffer[bytes_received] = '\0';
 
-        printf("Command from %s: %s",
+        buffer[strcspn(buffer,
+                       "\r\n")] = '\0';
+
+
+        printf("Command from %s: %s\n",
                username,
                buffer);
 
 
-        /*
-         * Remove \n or \r\n from command.
-         */
-        buffer[strcspn(buffer, "\r\n")] = '\0';
+        /* ================= LIST ================= */
 
-
-        /* =================================================
-           LIST
-           ================================================= */
-        if (strcmp(buffer, "LIST") == 0)
+        if (strcmp(buffer,
+                   "LIST") == 0)
         {
             send_user_list(client_socket);
         }
 
 
-        /* =================================================
-           BCAST <message>
-           ================================================= */
+        /* ================= BCAST ================= */
+
         else if (strncmp(buffer,
                          "BCAST ",
                          6) == 0)
         {
-            char *message = buffer + 6;
+            char *message =
+                buffer + 6;
 
-            if (strlen(message) == 0)
+
+            if (*message == '\0')
             {
                 const char *error =
-                    "ERR 005 INVALID_BCAST NID:6957\n";
+                    "ERR 005 INVALID_COMMAND NID:6957\n";
 
                 send(client_socket,
                      error,
@@ -444,36 +663,25 @@ void *handle_client(void *arg)
             }
 
 
-            /*
-             * Acknowledge sender.
-             */
+            broadcast_message(client_socket,
+                              username,
+                              message);
+
+
             {
                 const char *response =
-                    "OK BCAST NID:6957\n";
+                    "OK SENT NID:6957\n";
 
                 send(client_socket,
                      response,
                      strlen(response),
                      0);
             }
-
-
-            /*
-             * Send event to all connected clients.
-             */
-            broadcast_message(username,
-                              message);
-
-
-            printf("Broadcast from %s: %s\n",
-                   username,
-                   message);
         }
 
 
-        /* =================================================
-           PMSG <user> <message>
-           ================================================= */
+        /* ================= PMSG ================= */
+
         else if (strncmp(buffer,
                          "PMSG ",
                          5) == 0)
@@ -481,21 +689,14 @@ void *handle_client(void *arg)
             char target[USERNAME_SIZE];
             char message[BUFFER_SIZE];
 
-            /*
-             * Example:
-             *
-             * PMSG Ravi Hello Ravi
-             *
-             * target  = Ravi
-             * message = Hello Ravi
-             */
+
             if (sscanf(buffer + 5,
-                       "%63s %1019[^\n]",
+                       "%63s %2047[^\n]",
                        target,
                        message) != 2)
             {
                 const char *error =
-                    "ERR 005 INVALID_PMSG NID:6957\n";
+                    "ERR 005 INVALID_COMMAND NID:6957\n";
 
                 send(client_socket,
                      error,
@@ -506,30 +707,17 @@ void *handle_client(void *arg)
             }
 
 
-            /*
-             * Try to deliver private message.
-             */
             if (private_message(username,
                                 target,
                                 message))
             {
-                char response[256];
-
-                snprintf(response,
-                         sizeof(response),
-                         "OK PMSG %s NID:6957\n",
-                         target);
+                const char *response =
+                    "OK SENT NID:6957\n";
 
                 send(client_socket,
                      response,
                      strlen(response),
                      0);
-
-
-                printf("Private message from %s to %s: %s\n",
-                       username,
-                       target,
-                       message);
             }
             else
             {
@@ -540,18 +728,280 @@ void *handle_client(void *arg)
                      error,
                      strlen(error),
                      0);
-
-
-                printf("PMSG target not found: %s\n",
-                       target);
             }
         }
 
 
-        /* =================================================
-           QUIT
-           ================================================= */
-        else if (strcmp(buffer, "QUIT") == 0)
+        /* ================= JOIN ================= */
+
+        else if (strncmp(buffer,
+                         "JOIN ",
+                         5) == 0)
+        {
+            char room_name[ROOM_NAME_SIZE];
+            int room_index;
+
+
+            if (sscanf(buffer + 5,
+                       "%63s",
+                       room_name) != 1)
+            {
+                const char *error =
+                    "ERR 005 INVALID_COMMAND NID:6957\n";
+
+                send(client_socket,
+                     error,
+                     strlen(error),
+                     0);
+
+                continue;
+            }
+
+
+            pthread_mutex_lock(&rooms_mutex);
+
+
+            room_index =
+                find_room(room_name);
+
+
+            /*
+             * JOIN creates room if necessary.
+             */
+            if (room_index == -1)
+            {
+                room_index =
+                    create_room(room_name);
+            }
+
+
+            if (room_index == -1)
+            {
+                pthread_mutex_unlock(&rooms_mutex);
+
+                const char *error =
+                    "ERR 005 SERVER_FULL NID:6957\n";
+
+                send(client_socket,
+                     error,
+                     strlen(error),
+                     0);
+
+                continue;
+            }
+
+
+            add_room_member(room_index,
+                            client_socket);
+
+
+            pthread_mutex_unlock(&rooms_mutex);
+
+
+            {
+                char response[256];
+
+                snprintf(response,
+                         sizeof(response),
+                         "OK JOINED %s NID:6957\n",
+                         room_name);
+
+                send(client_socket,
+                     response,
+                     strlen(response),
+                     0);
+            }
+
+
+            printf("%s joined room %s\n",
+                   username,
+                   room_name);
+        }
+
+
+        /* ================= LEAVE ================= */
+
+        else if (strncmp(buffer,
+                         "LEAVE ",
+                         6) == 0)
+        {
+            char room_name[ROOM_NAME_SIZE];
+            int room_index;
+
+
+            if (sscanf(buffer + 6,
+                       "%63s",
+                       room_name) != 1)
+            {
+                const char *error =
+                    "ERR 005 INVALID_COMMAND NID:6957\n";
+
+                send(client_socket,
+                     error,
+                     strlen(error),
+                     0);
+
+                continue;
+            }
+
+
+            pthread_mutex_lock(&rooms_mutex);
+
+
+            room_index =
+                find_room(room_name);
+
+
+            if (room_index == -1)
+            {
+                pthread_mutex_unlock(&rooms_mutex);
+
+                const char *error =
+                    "ERR 003 ROOM_NOT_FOUND NID:6957\n";
+
+                send(client_socket,
+                     error,
+                     strlen(error),
+                     0);
+
+                continue;
+            }
+
+
+            remove_room_member(room_index,
+                               client_socket);
+
+
+            pthread_mutex_unlock(&rooms_mutex);
+
+
+            {
+                char response[256];
+
+                snprintf(response,
+                         sizeof(response),
+                         "OK LEFT %s NID:6957\n",
+                         room_name);
+
+                send(client_socket,
+                     response,
+                     strlen(response),
+                     0);
+            }
+
+
+            printf("%s left room %s\n",
+                   username,
+                   room_name);
+        }
+
+
+        /* ================= ROOMS ================= */
+
+        else if (strcmp(buffer,
+                        "ROOMS") == 0)
+        {
+            send_rooms(client_socket);
+        }
+
+
+        /* ================= RMSG ================= */
+
+        else if (strncmp(buffer,
+                         "RMSG ",
+                         5) == 0)
+        {
+            char room_name[ROOM_NAME_SIZE];
+            char message[BUFFER_SIZE];
+
+            int room_index;
+
+
+            if (sscanf(buffer + 5,
+                       "%63s %2047[^\n]",
+                       room_name,
+                       message) != 2)
+            {
+                const char *error =
+                    "ERR 005 INVALID_COMMAND NID:6957\n";
+
+                send(client_socket,
+                     error,
+                     strlen(error),
+                     0);
+
+                continue;
+            }
+
+
+            pthread_mutex_lock(&rooms_mutex);
+
+
+            room_index =
+                find_room(room_name);
+
+
+            if (room_index == -1)
+            {
+                pthread_mutex_unlock(&rooms_mutex);
+
+                const char *error =
+                    "ERR 003 ROOM_NOT_FOUND NID:6957\n";
+
+                send(client_socket,
+                     error,
+                     strlen(error),
+                     0);
+
+                continue;
+            }
+
+
+            /*
+             * Sender must belong to room.
+             */
+            if (!is_room_member(room_index,
+                                client_socket))
+            {
+                pthread_mutex_unlock(&rooms_mutex);
+
+                const char *error =
+                    "ERR 003 ROOM_NOT_FOUND NID:6957\n";
+
+                send(client_socket,
+                     error,
+                     strlen(error),
+                     0);
+
+                continue;
+            }
+
+
+            send_room_message(room_index,
+                              client_socket,
+                              username,
+                              message);
+
+
+            pthread_mutex_unlock(&rooms_mutex);
+
+
+            {
+                const char *response =
+                    "OK SENT NID:6957\n";
+
+                send(client_socket,
+                     response,
+                     strlen(response),
+                     0);
+            }
+        }
+
+
+        /* ================= QUIT ================= */
+
+        else if (strcmp(buffer,
+                        "QUIT") == 0)
         {
             const char *response =
                 "OK BYE NID:6957\n";
@@ -561,17 +1011,12 @@ void *handle_client(void *arg)
                  strlen(response),
                  0);
 
-
-            printf("%s requested QUIT.\n",
-                   username);
-
             break;
         }
 
 
-        /* =================================================
-           UNKNOWN / NOT YET IMPLEMENTED
-           ================================================= */
+        /* ================= INVALID ================= */
+
         else
         {
             const char *error =
@@ -585,9 +1030,10 @@ void *handle_client(void *arg)
     }
 
 
-    /*
-     * Remove user from connected-user table.
-     */
+    /* Remove client from rooms first. */
+    remove_client_from_all_rooms(client_socket);
+
+
     if (registered)
     {
         remove_client(client_socket);
@@ -597,7 +1043,8 @@ void *handle_client(void *arg)
     close(client_socket);
 
 
-    printf("Client thread finished.\n");
+    printf("Client thread finished: %s\n",
+           username);
 
 
     return NULL;
@@ -605,8 +1052,9 @@ void *handle_client(void *arg)
 
 
 /* =========================================================
-   MAIN SERVER
+   MAIN
    ========================================================= */
+
 int main(void)
 {
     int server_socket;
@@ -617,17 +1065,14 @@ int main(void)
     socklen_t client_length;
 
 
-    /*
-     * Initialise shared client table.
-     */
     memset(clients,
            0,
            sizeof(clients));
 
+    memset(rooms,
+           0,
+           sizeof(rooms));
 
-    /* =====================================================
-       STEP 1 — CREATE TCP SOCKET
-       ===================================================== */
 
     server_socket =
         socket(AF_INET,
@@ -646,10 +1091,6 @@ int main(void)
     printf("Server socket created successfully.\n");
 
 
-    /* =====================================================
-       STEP 2 — PREPARE SERVER ADDRESS
-       ===================================================== */
-
     memset(&server_address,
            0,
            sizeof(server_address));
@@ -658,18 +1099,12 @@ int main(void)
     server_address.sin_family =
         AF_INET;
 
-
     server_address.sin_addr.s_addr =
         INADDR_ANY;
-
 
     server_address.sin_port =
         htons(PORT);
 
-
-    /* =====================================================
-       STEP 3 — BIND
-       ===================================================== */
 
     if (bind(server_socket,
              (struct sockaddr *)&server_address,
@@ -687,10 +1122,6 @@ int main(void)
            PORT);
 
 
-    /* =====================================================
-       STEP 4 — LISTEN
-       ===================================================== */
-
     if (listen(server_socket,
                MAX_CLIENTS) < 0)
     {
@@ -705,10 +1136,6 @@ int main(void)
     printf("NetMessenger server listening on port %d...\n",
            PORT);
 
-
-    /* =====================================================
-       STEP 5 — ACCEPT CLIENTS CONTINUOUSLY
-       ===================================================== */
 
     while (1)
     {
@@ -752,9 +1179,6 @@ int main(void)
         printf("A client connected successfully!\n");
 
 
-        /*
-         * Create one worker thread per client.
-         */
         if (pthread_create(&thread_id,
                            NULL,
                            handle_client,
@@ -770,9 +1194,6 @@ int main(void)
         }
 
 
-        /*
-         * Automatically release thread resources.
-         */
         pthread_detach(thread_id);
     }
 
