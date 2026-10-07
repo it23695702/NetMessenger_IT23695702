@@ -441,13 +441,13 @@ void remove_client_from_all_rooms(int socket_fd)
 /* =========================================================
    LIST
    ========================================================= */
-
 void send_user_list(int socket_fd)
 {
     char response[BUFFER_SIZE];
     int i;
+    int first = 1;
 
-    strcpy(response, "OK USERS");
+    strcpy(response, "OK USERS ");
 
     pthread_mutex_lock(&clients_mutex);
 
@@ -455,8 +455,13 @@ void send_user_list(int socket_fd)
     {
         if (clients[i].active)
         {
-            strcat(response, " ");
+            if (!first)
+            {
+                strcat(response, ",");
+            }
+
             strcat(response, clients[i].username);
+            first = 0;
         }
     }
 
@@ -468,8 +473,6 @@ void send_user_list(int socket_fd)
              response,
              strlen(response));
 }
-
-
 /* =========================================================
    BCAST
    ========================================================= */
@@ -649,7 +652,6 @@ int safe_filename(const char *filename)
 /* =========================================================
    SENDFILE
    ========================================================= */
-
 void handle_sendfile(int sender_socket,
                      const char *sender,
                      const char *command)
@@ -669,6 +671,9 @@ void handle_sendfile(int sender_socket,
     FILE *file;
 
     int target_socket;
+    int room_index;
+    int i;
+    int delivered = 0;
 
 
     if (sscanf(command,
@@ -701,11 +706,23 @@ void handle_sendfile(int sender_socket,
     }
 
 
-    if (file_size_ll < 0 ||
-        file_size_ll > MAX_FILE_SIZE)
+    if (file_size_ll < 0)
     {
         const char *error =
             "ERR 005 INVALID_FILE_SIZE NID:6957\n";
+
+        send_all(sender_socket,
+                 error,
+                 strlen(error));
+
+        return;
+    }
+
+
+    if (file_size_ll > MAX_FILE_SIZE)
+    {
+        const char *error =
+            "ERR 004 FILE_TOO_LARGE NID:6957\n";
 
         send_all(sender_socket,
                  error,
@@ -719,8 +736,8 @@ void handle_sendfile(int sender_socket,
 
 
     /*
-     * Allocate at least one byte so a zero-size
-     * file is also handled safely.
+     * Allocate at least one byte so zero-size
+     * files can also be handled safely.
      */
     file_data = malloc(file_size > 0 ? file_size : 1);
 
@@ -738,9 +755,8 @@ void handle_sendfile(int sender_socket,
 
 
     /*
-     * IMPORTANT:
      * Receive exactly the number of raw bytes
-     * declared in the SENDFILE header.
+     * declared in the SENDFILE command.
      */
     if (file_size > 0 &&
         recv_exact(sender_socket,
@@ -757,31 +773,10 @@ void handle_sendfile(int sender_socket,
 
 
     /*
-     * Check whether target is currently online.
-     */
-    target_socket = find_user_socket(target);
-
-    if (target_socket == -1)
-    {
-        const char *error =
-            "ERR 002 USER_NOT_FOUND NID:6957\n";
-
-        send_all(sender_socket,
-                 error,
-                 strlen(error));
-
-        free(file_data);
-
-        return;
-    }
-
-
-    /*
-     * Create:
-     * storage/IT23695702/<sender>/
+     * Store a copy under:
+     * storage/IT23695702/<sender>/<filename>
      */
     make_storage_directories(sender);
-
 
     snprintf(storage_path,
              sizeof(storage_path),
@@ -819,7 +814,6 @@ void handle_sendfile(int sender_socket,
                    file) != file_size)
         {
             fclose(file);
-
             free(file_data);
 
             {
@@ -845,7 +839,7 @@ void handle_sendfile(int sender_socket,
 
 
     /*
-     * Forward header to recipient.
+     * Header sent before the raw file bytes.
      */
     snprintf(file_header,
              sizeof(file_header),
@@ -855,31 +849,27 @@ void handle_sendfile(int sender_socket,
              file_size);
 
 
-    if (send_all(target_socket,
-                 file_header,
-                 strlen(file_header)) < 0)
-    {
-        const char *error =
-            "ERR 002 USER_NOT_FOUND NID:6957\n";
-
-        send_all(sender_socket,
-                 error,
-                 strlen(error));
-
-        free(file_data);
-
-        return;
-    }
-
-
     /*
-     * Forward exact raw file bytes.
+     * First check whether target is a connected user.
      */
-    if (file_size > 0)
+    target_socket = find_user_socket(target);
+
+    if (target_socket != -1)
     {
         if (send_all(target_socket,
-                     file_data,
-                     file_size) < 0)
+                     file_header,
+                     strlen(file_header)) >= 0)
+        {
+            if (file_size == 0 ||
+                send_all(target_socket,
+                         file_data,
+                         file_size) >= 0)
+            {
+                delivered = 1;
+            }
+        }
+
+        if (!delivered)
         {
             const char *error =
                 "ERR 002 USER_NOT_FOUND NID:6957\n";
@@ -893,19 +883,81 @@ void handle_sendfile(int sender_socket,
             return;
         }
     }
+    else
+    {
+        /*
+         * Target was not a username.
+         * Check whether it is a room.
+         */
+        pthread_mutex_lock(&rooms_mutex);
+
+        room_index = find_room(target);
+
+        if (room_index == -1)
+        {
+            pthread_mutex_unlock(&rooms_mutex);
+
+            {
+                const char *error =
+                    "ERR 003 ROOM_NOT_FOUND NID:6957\n";
+
+                send_all(sender_socket,
+                         error,
+                         strlen(error));
+            }
+
+            free(file_data);
+
+            return;
+        }
 
 
+        /*
+         * Send the file to all other members
+         * currently inside the room.
+         */
+        for (i = 0; i < MAX_CLIENTS; i++)
+        {
+            int member_socket =
+                rooms[room_index].member_sockets[i];
+
+            if (member_socket != -1 &&
+                member_socket != sender_socket)
+            {
+                if (send_all(member_socket,
+                             file_header,
+                             strlen(file_header)) >= 0)
+                {
+                    if (file_size == 0 ||
+                        send_all(member_socket,
+                                 file_data,
+                                 file_size) >= 0)
+                    {
+                        delivered = 1;
+                    }
+                }
+            }
+        }
+
+        pthread_mutex_unlock(&rooms_mutex);
+    }
+
+
+    /*
+     * Required successful SENDFILE response.
+     */
     snprintf(response,
              sizeof(response),
-             "OK FILESENT %s %s NID:6957\n",
-             target,
+             "OK FILE_RECEIVED %s NID:6957\n",
              filename);
-
 
     send_all(sender_socket,
              response,
              strlen(response));
-
+   
+             write_log("SENDFILE",
+          sender,
+          filename);
 
     printf("File sent: %s -> %s : %s (%zu bytes)\n",
            sender,
@@ -916,7 +968,6 @@ void handle_sendfile(int sender_socket,
 
     free(file_data);
 }
-
 
 /* =========================================================
    CLIENT THREAD
@@ -1120,6 +1171,9 @@ void *handle_client(void *arg)
             broadcast_message(client_socket,
                               username,
                               message);
+            write_log("BCAST",
+          username,
+          message);
 
             {
                 const char *response =
@@ -1161,6 +1215,9 @@ void *handle_client(void *arg)
                                 target,
                                 message))
             {
+                  write_log("PMSG",
+              username,
+              message);
                 const char *response =
                     "OK SENT NID:6957\n";
 
@@ -1259,81 +1316,89 @@ void *handle_client(void *arg)
                    room_name);
         }
 
+/* ================= LEAVE ================= */
 
-        /* ================= LEAVE ================= */
+else if (strncmp(buffer,
+                 "LEAVE ",
+                 6) == 0)
+{
+    char room_name[ROOM_NAME_SIZE];
+    int room_index;
 
-        else if (strncmp(buffer,
-                         "LEAVE ",
-                         6) == 0)
+    if (sscanf(buffer + 6,
+               "%63s",
+               room_name) != 1)
+    {
+        const char *error =
+            "ERR 005 INVALID_COMMAND NID:6957\n";
+
+        send_all(client_socket,
+                 error,
+                 strlen(error));
+
+        continue;
+    }
+
+    pthread_mutex_lock(&rooms_mutex);
+
+    room_index = find_room(room_name);
+
+    if (room_index == -1)
+    {
+        pthread_mutex_unlock(&rooms_mutex);
+
         {
-            char room_name[ROOM_NAME_SIZE];
-            int room_index;
+            const char *error =
+                "ERR 003 ROOM_NOT_FOUND NID:6957\n";
 
-
-            if (sscanf(buffer + 6,
-                       "%63s",
-                       room_name) != 1)
-            {
-                const char *error =
-                    "ERR 005 INVALID_COMMAND NID:6957\n";
-
-                send_all(client_socket,
-                         error,
-                         strlen(error));
-
-                continue;
-            }
-
-
-            pthread_mutex_lock(&rooms_mutex);
-
-            room_index =
-                find_room(room_name);
-
-
-            if (room_index == -1)
-            {
-                pthread_mutex_unlock(&rooms_mutex);
-
-                {
-                    const char *error =
-                        "ERR 003 ROOM_NOT_FOUND NID:6957\n";
-
-                    send_all(client_socket,
-                             error,
-                             strlen(error));
-                }
-
-                continue;
-            }
-
-
-            remove_room_member(room_index,
-                               client_socket);
-
-            pthread_mutex_unlock(&rooms_mutex);
-
-
-            {
-                char response[256];
-
-                snprintf(response,
-                         sizeof(response),
-                         "OK LEFT %s NID:6957\n",
-                         room_name);
-
-                send_all(client_socket,
-                         response,
-                         strlen(response));
-            }
-
-
-            printf("%s left room %s\n",
-                   username,
-                   room_name);
+            send_all(client_socket,
+                     error,
+                     strlen(error));
         }
 
+        continue;
+    }
 
+    /* Check whether client is actually in the room */
+    if (!is_room_member(room_index,
+                        client_socket))
+    {
+        pthread_mutex_unlock(&rooms_mutex);
+
+        {
+            const char *error =
+                "ERR 003 ROOM_NOT_FOUND NID:6957\n";
+
+            send_all(client_socket,
+                     error,
+                     strlen(error));
+        }
+
+        continue;
+    }
+
+    remove_room_member(room_index,
+                       client_socket);
+
+    pthread_mutex_unlock(&rooms_mutex);
+
+    {
+        char response[256];
+
+        snprintf(response,
+                 sizeof(response),
+                 "OK LEFT %s NID:6957\n",
+                 room_name);
+
+        send_all(client_socket,
+                 response,
+                 strlen(response));
+    }
+
+    printf("%s left room %s\n",
+           username,
+           room_name);
+}
         /* ================= ROOMS ================= */
 
         else if (strcmp(buffer,
@@ -1418,6 +1483,9 @@ void *handle_client(void *arg)
 
             pthread_mutex_unlock(&rooms_mutex);
 
+            write_log("RMSG",
+          username,
+          message);
 
             {
                 const char *response =
