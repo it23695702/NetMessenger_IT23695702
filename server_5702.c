@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <errno.h>
+#include <time.h>
 
 #define PORT 11702
 #define MAX_CLIENTS 10
@@ -38,6 +39,7 @@ Room rooms[MAX_ROOMS];
 
 pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t rooms_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 
 /* =========================================================
@@ -216,7 +218,92 @@ int find_user_socket(const char *username)
 
     return result;
 }
+/* =========================================================
+   SERVER LOGGING
+   ========================================================= */
 
+void write_log(const char *event,
+               const char *username,
+               const char *details)
+{
+    FILE *log_file;
+    time_t now;
+    struct tm *time_info;
+    char timestamp[64];
+
+    time(&now);
+    time_info = localtime(&now);
+
+    if (time_info == NULL)
+    {
+        return;
+    }
+
+    strftime(timestamp,
+             sizeof(timestamp),
+             "%Y-%m-%d %H:%M:%S",
+             time_info);
+
+    pthread_mutex_lock(&log_mutex);
+
+    log_file = fopen("netmsg_IT23695702.log", "a");
+
+    if (log_file != NULL)
+    {
+        fprintf(log_file,
+                "[%s] %s %s",
+                timestamp,
+                event,
+                username);
+
+        if (details != NULL &&
+            details[0] != '\0')
+        {
+            fprintf(log_file,
+                    " %s",
+                    details);
+        }
+
+        fprintf(log_file, "\n");
+        fclose(log_file);
+    }
+
+    pthread_mutex_unlock(&log_mutex);
+}
+
+
+/* =========================================================
+   PRESENCE NOTIFICATION
+   ========================================================= */
+
+void send_presence_notification(int user_socket,
+                                const char *username,
+                                const char *status)
+{
+    char message[256];
+    int i;
+
+    snprintf(message,
+             sizeof(message),
+             "PRESENCE %s %s NID:6957\n",
+             username,
+             status);
+
+    pthread_mutex_lock(&clients_mutex);
+
+    for (i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (clients[i].active &&
+            clients[i].socket != user_socket)
+        {
+            send_all(clients[i].socket,
+                     message,
+                     strlen(message));
+        }
+    }
+
+    pthread_mutex_unlock(&clients_mutex);
+}
 
 /* =========================================================
    ROOM FUNCTIONS
@@ -967,6 +1054,13 @@ void *handle_client(void *arg)
 
     printf("Registered username: %s\n",
            username);
+    write_log("REGISTER",
+          username,
+          "");
+
+    send_presence_notification(client_socket,
+                           username,
+                           "JOINED");
 
 
     /* =====================================================
@@ -1378,14 +1472,20 @@ void *handle_client(void *arg)
     }
 
 
-    remove_client_from_all_rooms(client_socket);
-
+       remove_client_from_all_rooms(client_socket);
 
     if (registered)
     {
+        send_presence_notification(client_socket,
+                                   username,
+                                   "LEFT");
+
+        write_log("DISCONNECT",
+                  username,
+                  "");
+
         remove_client(client_socket);
     }
-
 
     close(client_socket);
 
